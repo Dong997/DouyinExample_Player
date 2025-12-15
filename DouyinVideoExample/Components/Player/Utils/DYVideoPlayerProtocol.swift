@@ -30,6 +30,26 @@ public enum DYPlayerState: Equatable {
     }
 }
 
+public extension DYPlayerState {
+    var isError: Bool {
+        if case .error = self {
+            return true
+        }
+        return false
+    }
+}
+
+/// 视频画面填充模式
+/// 与系统 AVLayerVideoGravity 保持一一对应关系
+public enum DYVideoGravity {
+    /// 等比缩放，全部内容可见，可能留黑边
+    case aspectFit
+    /// 等比填充，铺满视图，可能裁剪部分内容
+    case aspectFill
+    /// 拉伸填充，不保证比例
+    case resize
+}
+
 // MARK: - Player Delegate Protocol
 /// 播放器代理协议 - 所有的回调事件
 public protocol DYVideoPlayerDelegate: AnyObject {
@@ -65,6 +85,8 @@ public protocol DYVideoPlayerDelegate: AnyObject {
     
     /// 视频尺寸信息回调 (可用于调整UI比例)
     func player(_ player: DYVideoPlayer, didUpdateVideoSize size: CGSize)
+    
+    func player(_ player: DYVideoPlayer, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?)
 }
 
 // MARK: - Optional Implementation
@@ -74,6 +96,7 @@ public extension DYVideoPlayerDelegate {
     func player(_ player: DYVideoPlayer, didFailWithError error: Error?) {}
     func playerDidFinishPlaying(_ player: DYVideoPlayer) {}
     func player(_ player: DYVideoPlayer, didUpdateVideoSize size: CGSize) {}
+    func player(_ player: DYVideoPlayer, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?) {}
 }
 
 // MARK: - Player Interface Protocol
@@ -93,7 +116,7 @@ public protocol DYVideoPlayerInput {
     ///   - url: 视频URL
     ///   - view: 承载视频画面的父视图
     ///   - seekTo: 起始播放时间
-    func play(url: URL, in view: UIView, seekTo: Double?)
+    func play(url: URL, in view: UIView, seekTo: TimeInterval?)
     
     /// 暂停
     func pause()
@@ -123,3 +146,17 @@ public extension DYVideoPlayerInput {
     }
 }
 
+/// 播放器高级控制协议
+/// 在基础播放能力之上，扩展倍速与画面填充等控制能力
+public protocol DYVideoAdvancedControlInput: DYVideoPlayerInput {
+    /// 当前播放速度（1.0 为正常速度）
+    var playbackRate: Float { get set }
+    /// 当前视频画面填充策略
+    var videoGravity: DYVideoGravity { get set }
+    /// 设置播放速度
+    /// - Parameter rate: 目标倍速 (例如 0.5/1.0/2.0)
+    func setPlaybackRate(_ rate: Float)
+    /// 设置视频画面填充模式
+    /// - Parameter gravity: 目标填充模式
+    func setVideoGravity(_ gravity: DYVideoGravity)
+}

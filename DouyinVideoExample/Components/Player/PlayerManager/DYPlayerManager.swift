@@ -15,13 +15,13 @@ public class DYPlayerManager: NSObject {
         player.isLooping = true
     }
     
-    /// 播放视频
-    /// - Parameters:
-    ///   - url: 视频地址
-    ///   - view: 承载视图
-    ///   - seekTo: 起始播放时间
-    public func play(url: URL, in view: UIView, seekTo: Double? = nil) {
+    public func play(url: URL, in view: UIView, seekTo: TimeInterval? = nil) {
         player.play(url: url, in: view, seekTo: seekTo)
+    }
+    
+    public func playWithCache(originalURL: URL, in view: UIView, seekTo: TimeInterval? = nil) {
+        let proxyURL = VideoCacheManager.shared.getProxyURL(for: originalURL)
+        player.playWithCache(originalURL: originalURL, proxyURL: proxyURL, in: view, seekTo: seekTo)
     }
     
     /// 暂停

@@ -9,6 +9,7 @@ class HomeViewController: UIViewController {
     private let viewModel = HomeViewModel()
     private var cancellables = Set<AnyCancellable>()
     private var currentPlayingIndexPath: IndexPath?
+    private var fullscreenTransitioningDelegate: FullscreenVideoTransitioningDelegate?
     private let bottomBar: UIView = {
         let barView = UIView()
         barView.backgroundColor = UIColor.gray
@@ -47,6 +48,7 @@ class HomeViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .gray
         
+        VideoCacheManager.shared.clearAllCache()
         // 启动视频缓存代理服务
         VideoCacheManager.shared.start()
         
@@ -158,33 +160,31 @@ class HomeViewController: UIViewController {
         cell.controlView.updateProgress(currentTime: 0, totalTime: 0)
         cell.controlView.updateCenterBtnState(.preparing)
         
-        // 1. 获取代理 URL (支持边下边播和缓存)
-        let proxyURL = VideoCacheManager.shared.getProxyURL(for: video.videoURL)
-        
-        // 2. 播放
+        // 使用缓存代理播放，如果代理失败会自动降级为原始 URL
         if video.resumeTime > 0 {
-            DYPlayerManager.shared.play(url: proxyURL, in: cell.playerContainerView, seekTo: video.resumeTime)
+            DYPlayerManager.shared.playWithCache(originalURL: video.videoURL, in: cell.playerContainerView, seekTo: video.resumeTime)
         } else {
-            DYPlayerManager.shared.play(url: proxyURL, in: cell.playerContainerView)
+            DYPlayerManager.shared.playWithCache(originalURL: video.videoURL, in: cell.playerContainerView)
         }
         
-        // 3. 更新预加载策略 (前后各预加载1个)
+        // 更新预加载策略 (前后各预加载1个)
         let allURLs = viewModel.videos.map { $0.videoURL }
         VideoPreloadManager.shared.updateStrategy(currentURL: video.videoURL, allURLs: allURLs)
     }
 
     private func presentFullscreen(for indexPath: IndexPath) {
         guard viewModel.videos.indices.contains(indexPath.item) else { return }
+        guard let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
         let video = viewModel.videos[indexPath.item]
         let currentTime = DYPlayerManager.shared.player.currentTime
-        let proxyURL = VideoCacheManager.shared.getProxyURL(for: video.videoURL)
         let horizontalAspectRatio = video.aspectRatio ?? 1.1
-       let fullscreenOrientationMask: UIInterfaceOrientationMask = horizontalAspectRatio > 1.0 ? .landscapeRight : .portrait
+        let fullscreenOrientationMask: UIInterfaceOrientationMask = horizontalAspectRatio > 1.0 ? .landscapeRight : .portrait
         let fullscreenViewController = FullscreenVideoViewController(
-            videoURL: proxyURL,
+            videoURL: video.videoURL,
             currentTime: currentTime,
             aspectRatio: video.aspectRatio,
-            fullscreenOrientationMask: fullscreenOrientationMask
+            fullscreenOrientationMask: fullscreenOrientationMask,
+            player: DYPlayerManager.shared.player
         )
         fullscreenViewController.onDismiss = { [weak self] in
             guard let self = self else { return }
@@ -193,27 +193,30 @@ class HomeViewController: UIViewController {
             self.collectionView.isHidden = false
             self.restorePlayerAfterFullscreen(at: indexPath)
         }
-        bottomBar.isHidden = true
-        collectionView.isHidden = true
+        let transitionDelegate = FullscreenVideoTransitioningDelegate(
+            originView: cell.playerContainerView,
+            fullscreenOrientationMask: fullscreenOrientationMask
+        )
+        fullscreenTransitioningDelegate = transitionDelegate
+        fullscreenViewController.transitioningDelegate = transitionDelegate
         fullscreenViewController.modalPresentationStyle = .fullScreen
-        present(fullscreenViewController, animated: false, completion: nil)
+        present(fullscreenViewController, animated: true, completion: nil)
     }
 
     private func restorePlayerAfterFullscreen(at indexPath: IndexPath) {
         guard viewModel.videos.indices.contains(indexPath.item) else { return }
         let video = viewModel.videos[indexPath.item]
         let currentTime = DYPlayerManager.shared.player.currentTime
-        let proxyURL = VideoCacheManager.shared.getProxyURL(for: video.videoURL)
         if let cell = collectionView.cellForItem(at: indexPath) as? VideoCell {
             cell.controlView.delegate = self
-            DYPlayerManager.shared.play(url: proxyURL, in: cell.playerContainerView, seekTo: currentTime)
+            DYPlayerManager.shared.playWithCache(originalURL: video.videoURL, in: cell.playerContainerView, seekTo: currentTime)
             cell.controlView.updateCenterBtnState(.playing)
         } else {
             collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: false)
             collectionView.layoutIfNeeded()
             if let cell = collectionView.cellForItem(at: indexPath) as? VideoCell {
                 cell.controlView.delegate = self
-                DYPlayerManager.shared.play(url: proxyURL, in: cell.playerContainerView, seekTo: currentTime)
+                DYPlayerManager.shared.playWithCache(originalURL: video.videoURL, in: cell.playerContainerView, seekTo: currentTime)
                 cell.controlView.updateCenterBtnState(.playing)
             }
         }
@@ -274,21 +277,7 @@ extension HomeViewController: DYVideoPlayerDelegate {
     func player(_ player: DYVideoPlayer, didChangeState state: DYPlayerState) {
         guard let indexPath = currentPlayingIndexPath,
               let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
-        
-        switch state {
-        case .playing:
-            cell.controlView.updateCenterBtnState(.playing)
-        case .buffering:
-            cell.controlView.updateCenterBtnState(.notPlaying)
-        case .paused:
-            cell.controlView.updateCenterBtnState(.notPlaying)
-        case .idle, .preparing:
-            cell.controlView.updateCenterBtnState(.preparing)
-        case .finished:
-            cell.controlView.updateCenterBtnState(.preparing)
-        case .error(_):
-            cell.controlView.updateCenterBtnState(.error)
-        }
+        cell.controlView.updateCenterBtnState(state)
     }
     
     func player(_ player: DYVideoPlayer, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double) {
@@ -343,5 +332,18 @@ extension HomeViewController: DYPlayerControlViewDelegate {
     func controlViewDidTapFullscreen(_ controlView: DYPlayerControlView) {
         guard let indexPath = currentPlayingIndexPath else { return }
         presentFullscreen(for: indexPath)
+    }
+    
+    func controlViewDidBeginFastPlay(_ controlView: DYPlayerControlView) {
+        let player = DYPlayerManager.shared.player
+        if player.state != .playing {
+            player.resume()
+        }
+        player.setPlaybackRate(2.0)
+    }
+    
+    func controlViewDidEndFastPlay(_ controlView: DYPlayerControlView) {
+        let player = DYPlayerManager.shared.player
+        player.setPlaybackRate(1.0)
     }
 }

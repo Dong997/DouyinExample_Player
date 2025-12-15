@@ -1,18 +1,69 @@
 import Foundation
 import KTVHTTPCache
 
+/// 视频缓存管理器的预加载回调协议
+/// 提供预加载进度、完成与失败三类事件
+public protocol VideoCacheManagerDelegate: AnyObject {
+    /// 预加载进度变更回调
+    /// - Parameters:
+    ///   - manager: 缓存管理器实例
+    ///   - progress: 当前预加载进度 (0.0 ~ 1.0)
+    ///   - url: 正在预加载的资源 URL
+    func videoCacheManager(_ manager: VideoCacheManager, didUpdatePreloadProgress progress: Double, for url: URL)
+    
+    /// 单个资源预加载完成回调
+    /// - Parameters:
+    ///   - manager: 缓存管理器实例
+    ///   - url: 预加载完成的资源 URL
+    func videoCacheManager(_ manager: VideoCacheManager, didFinishPreloadFor url: URL)
+    
+    /// 单个资源预加载失败回调
+    /// - Parameters:
+    ///   - manager: 缓存管理器实例
+    ///   - url: 预加载失败的资源 URL
+    ///   - error: 具体错误信息
+    func videoCacheManager(_ manager: VideoCacheManager, didFailPreloadFor url: URL, error: Error)
+}
+
+public extension VideoCacheManagerDelegate {
+    func videoCacheManager(_ manager: VideoCacheManager, didUpdatePreloadProgress progress: Double, for url: URL) {}
+    func videoCacheManager(_ manager: VideoCacheManager, didFinishPreloadFor url: URL) {}
+    func videoCacheManager(_ manager: VideoCacheManager, didFailPreloadFor url: URL, error: Error) {}
+}
+
+public extension Notification.Name {
+    /// 预加载进度通知，userInfo: ["url": URL, "progress": Double]
+    static let videoCacheManagerPreloadProgress = Notification.Name("VideoCacheManagerPreloadProgress")
+    /// 预加载完成通知，userInfo: ["url": URL]
+    static let videoCacheManagerPreloadFinished = Notification.Name("VideoCacheManagerPreloadFinished")
+    /// 预加载失败通知，userInfo: ["url": URL, "error": Error]
+    static let videoCacheManagerPreloadFailed = Notification.Name("VideoCacheManagerPreloadFailed")
+}
+
 /// 视频缓存管理器 - 基于 KTVHTTPCache 封装
-/// 负责视频资源的缓存、预加载、代理URL生成等
+/// 负责视频资源的缓存、预加载、代理 URL 生成等
 public class VideoCacheManager: NSObject {
     
+    /// 全局单例访问入口
     public static let shared = VideoCacheManager()
     
-    // 用于持有预加载的 loader，防止被释放
-    // Key: URL absolute string
+    /// 当前正在预加载的 loader 列表，key 为 URL 字符串
     private var preloadLoaders: [String: KTVHCDataLoader] = [:]
     
-    // 记录预加载/缓存失败的 URL，遇到这些 URL 时降级使用原始 URL 播放
-    private var blacklistedURLs: Set<URL> = []
+    /// 手动加入的黑名单 URL 集合（业务层通过 addToBlacklist 管理）
+    private var manualBlacklistedURLs: Set<URL> = []
+    /// 自动记录的黑名单 URL 集合（由预加载失败自动维护）
+    private var autoBlacklistedURLs: Set<URL> = []
+    /// 自动黑名单的时间戳，用于计算 TTL 是否过期
+    private var autoBlacklistTimestamps: [URL: Date] = [:]
+    
+    /// 是否启用自动黑名单逻辑，默认 true
+    public var isAutoBlacklistEnabled: Bool = true
+    /// 自动黑名单有效期，nil 表示永久有效
+    public var autoBlacklistTTL: TimeInterval?
+    
+    /// 外部 delegate，用于接收预加载进度和结果回调
+    public weak var delegate: VideoCacheManagerDelegate?
     
     private override init() {
         super.init()
@@ -23,8 +74,30 @@ public class VideoCacheManager: NSObject {
     
     /// 手动将 URL 加入黑名单 (通常用于播放器报错时)
     public func addToBlacklist(url: URL) {
-        blacklistedURLs.insert(url)
+        manualBlacklistedURLs.insert(url)
         print("[VideoCacheManager] URL added to blacklist manually: \(url.lastPathComponent)")
+    }
+
+    private func isURLInBlacklist(_ url: URL) -> Bool {
+        if manualBlacklistedURLs.contains(url) {
+            return true
+        }
+        if isAutoBlacklistEnabled == false {
+            return false
+        }
+        if let ttl = autoBlacklistTTL {
+            if let createdAt = autoBlacklistTimestamps[url] {
+                let interval = Date().timeIntervalSince(createdAt)
+                if interval > ttl {
+                    autoBlacklistedURLs.remove(url)
+                    autoBlacklistTimestamps.removeValue(forKey: url)
+                    return false
+                }
+            } else if autoBlacklistedURLs.contains(url) {
+                autoBlacklistTimestamps[url] = Date()
+            }
+        }
+        return autoBlacklistedURLs.contains(url)
     }
     
     // MARK: - Configuration
@@ -76,8 +149,7 @@ public class VideoCacheManager: NSObject {
     /// - Parameter originalURL: 原始视频 URL
     /// - Returns: 代理后的 URL，如果生成失败返回原始 URL
     public func getProxyURL(for originalURL: URL) -> URL {
-        // 1. 如果该 URL 在黑名单中（之前报错过），直接返回原始 URL
-        if blacklistedURLs.contains(originalURL) {
+        if isURLInBlacklist(originalURL) {
             print("[VideoCacheManager] URL is in blacklist, using original URL: \(originalURL.lastPathComponent)")
             return originalURL
         }
@@ -189,6 +261,9 @@ extension VideoCacheManager: KTVHCDataLoaderDelegate {
         if let url = loader.request.url {
             print("[VideoCacheManager] Preload finished: \(url.lastPathComponent)")
             preloadLoaders.removeValue(forKey: url.absoluteString)
+            delegate?.videoCacheManager(self, didFinishPreloadFor: url)
+            let userInfo: [AnyHashable: Any] = ["url": url]
+            NotificationCenter.default.post(name: .videoCacheManagerPreloadFinished, object: self, userInfo: userInfo)
         }
     }
     
@@ -197,12 +272,21 @@ extension VideoCacheManager: KTVHCDataLoaderDelegate {
             print("[VideoCacheManager] Preload failed: \(url.lastPathComponent), error: \(error.localizedDescription)")
             preloadLoaders.removeValue(forKey: url.absoluteString)
             
-            // 记录失败的 URL
-            blacklistedURLs.insert(url)
+            if isAutoBlacklistEnabled {
+                autoBlacklistedURLs.insert(url)
+                autoBlacklistTimestamps[url] = Date()
+            }
+            delegate?.videoCacheManager(self, didFailPreloadFor: url, error: error)
+            let userInfo: [AnyHashable: Any] = ["url": url, "error": error]
+            NotificationCenter.default.post(name: .videoCacheManagerPreloadFailed, object: self, userInfo: userInfo)
         }
     }
     
     public func ktv_loader(_ loader: KTVHCDataLoader, didChangeProgress progress: Double) {
-        // 可以在这里广播进度，如果需要的话
+        if let url = loader.request.url {
+            delegate?.videoCacheManager(self, didUpdatePreloadProgress: progress, for: url)
+            let userInfo: [AnyHashable: Any] = ["url": url, "progress": progress]
+            NotificationCenter.default.post(name: .videoCacheManagerPreloadProgress, object: self, userInfo: userInfo)
+        }
     }
 }

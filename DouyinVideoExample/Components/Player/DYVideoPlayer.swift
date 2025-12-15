@@ -1,38 +1,59 @@
 import UIKit
 import AVFoundation
 
-/// 基于 AVPlayer 封装的视频播放器组件
-public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
+/// 基于 AVPlayer 封装的短视频播放器组件
+/// 负责：
+/// 1. 管理 AVPlayer / AVPlayerItem / AVPlayerLayer 生命周期
+/// 2. 暴露统一的播放控制接口（播放、暂停、停止、seek、倍速等）
+/// 3. 维护播放器状态机，并通过 delegate 将状态、进度等回调给上层
+/// 4. 支持在不同承载视图之间无缝迁移（如列表 cell 与全屏页面）
+public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     
     // MARK: - Public Properties
     
+    /// 播放器回调代理
+    /// 用于接收状态变化、进度、缓冲、错误等事件
     public weak var delegate: DYVideoPlayerDelegate?
     
-    public var state: DYPlayerState = .idle {
-        didSet {
-            guard state != oldValue else { return }
-            DispatchQueue.main.async {
-                self.delegate?.player(self, didChangeState: self.state)
-            }
-        }
-    }
+    /// 播放器当前状态（只读）
+    /// 所有状态变更必须通过内部 updateState 方法触发
+    public private(set) var state: DYPlayerState = .idle
     
+    /// 当前绑定的承载视图（只读，弱引用）
+    /// 通过 play(url:in:) 或 updateContainer(_:) 更新
+    public private(set) weak var containerView: UIView?
+    
+    /// 当前播放的原始视频地址（用于缓存失败时降级重试）
+    private var originalURLForRetry: URL?
+    
+    /// 当前播放的代理视频地址（由缓存代理生成）
+    private var proxyURLForRetry: URL?
+    
+    /// 是否已经从代理 URL 降级为原始 URL 进行过一次重试
+    private var hasRetriedWithOriginalURL: Bool = false
+    
+    /// 是否静音
     public var isMuted: Bool = false {
         didSet {
+            assertMainThread()
             player?.isMuted = isMuted
         }
     }
     
+    /// 是否循环播放，默认 true，适合抖音风格短视频
     public var isLooping: Bool = true // 默认开启循环播放，符合抖音风格
     
+    /// 播放音量（0.0 ~ 1.0）
     public var volume: Float = 1.0 {
         didSet {
+            assertMainThread()
             player?.volume = volume
         }
     }
     
     public var playbackRate: Float = 1.0 {
         didSet {
+            assertMainThread()
             if let player = player {
                 if state == .playing {
                     player.rate = playbackRate
@@ -40,9 +61,9 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
             }
         }
     }
-    public enum DYVideoGravity { case aspectFit, aspectFill, resize }
     public var videoGravity: DYVideoGravity = .aspectFit {
         didSet {
+            assertMainThread()
             updatePlayerLayerGravity()
         }
     }
@@ -58,14 +79,21 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
     // MARK: - Private Properties
     
     private var player: AVPlayer?
+    
     private var playerItem: AVPlayerItem?
+    
     private var playerLayer: AVPlayerLayer?
-    private var pendingSeekTime: Double?
+    
+    private var pendingSeekTime: TimeInterval?
     
     // Observers
+    /// 播放进度观察者句柄
     private var timeObserver: Any?
+    /// 播放项状态 KVO
     private var statusObserver: NSKeyValueObservation?
+    /// 缓冲进度 KVO
     private var bufferObserver: NSKeyValueObservation?
+    /// 播放控制状态 KVO（iOS 10+）
     private var timeControlStatusObserver: NSKeyValueObservation?
     
     // MARK: - Initialization
@@ -76,13 +104,23 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
     }
     
     deinit {
-        stop()
+        cleanupPlayerResources(resetState: false)
         print("DYVideoPlayer deinit")
     }
     
     // MARK: - Public Methods
     
-    public func play(url: URL, in view: UIView, seekTo: Double? = nil) {
+    public func playWithCache(originalURL: URL, proxyURL: URL, in view: UIView, seekTo: TimeInterval? = nil) {
+        assertMainThread()
+        originalURLForRetry = originalURL
+        proxyURLForRetry = proxyURL
+        hasRetriedWithOriginalURL = false
+        play(url: proxyURL, in: view, seekTo: seekTo)
+    }
+    
+    public func play(url: URL, in view: UIView, seekTo: TimeInterval? = nil) {
+        assertMainThread()
+        let previousContainer = containerView
         stop()
         self.pendingSeekTime = seekTo
         var playerItem: AVPlayerItem
@@ -121,13 +159,20 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
 
             view.layer.addSublayer(layer)
             self.playerLayer = layer
-
+            
             self.addObservers()
-            self.state = .preparing
+            self.updateState(.preparing)
+            self.containerView = view
+            if previousContainer !== view {
+                self.delegate?.player(self, didChangeContainerFrom: previousContainer, to: view)
+            }
         }
     }
     
+    /// 恢复播放
+    /// 如果当前状态是 finished，会从头开始播放
     public func resume() {
+        assertMainThread()
         if state == .finished {
             seek(to: 0) { [weak self] _ in
                 if let player = self?.player {
@@ -143,24 +188,22 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
         }
     }
     
+    /// 暂停播放（保留当前进度）
     public func pause() {
+        assertMainThread()
         player?.pause()
-        state = .paused
+        updateState(.paused)
     }
     
+    /// 停止播放并释放当前播放器资源
+    /// 会重置状态为 idle，移除 layer 和观察者
     public func stop() {
-        player?.pause()
-        player?.replaceCurrentItem(with: nil)
-        playerLayer?.removeFromSuperlayer()
-        
-        player = nil
-        playerItem = nil
-        playerLayer = nil
-        
-        state = .idle
+        assertMainThread()
+        cleanupPlayerResources(resetState: true)
     }
     
-    public func seek(to time: Double, completion: ((Bool) -> Void)? = nil) {
+    public func seek(to time: TimeInterval, completion: ((Bool) -> Void)? = nil) {
+        assertMainThread()
         guard let player = player else {
             completion?(false)
             return
@@ -173,7 +216,11 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
     }
     
     /// 更新播放器承载视图 (用于全屏切换)
+    /// 会将当前 AVPlayerLayer 从旧 view 移动到新的 view 上
+    /// 并通过 delegate 通知 container 变更
     public func updateContainer(_ view: UIView) {
+        assertMainThread()
+        let previousContainer = containerView
         guard let layer = playerLayer else {
             print("Warning: playerLayer is nil, cannot update container")
             return
@@ -217,24 +264,76 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
         }
         
         print("Player container updated, new frame: \(view.bounds), gravity: \(videoGravity)")
+        containerView = view
+        if previousContainer !== view {
+            delegate?.player(self, didChangeContainerFrom: previousContainer, to: view)
+        }
     }
-
+    
+    /// 设置播放速度（0.5x ~ 3.0x）
+    /// 如果当前未播放，会直接以指定倍速开始播放
     public func setPlaybackRate(_ rate: Float) {
+        assertMainThread()
         playbackRate = max(0.5, min(rate, 3.0))
         guard let player = player else { return }
         if state == .playing {
             player.rate = playbackRate
         } else {
             player.playImmediately(atRate: playbackRate)
-            state = .playing
+            updateState(.playing)
         }
     }
+    
+    /// 设置视频画面填充模式
     public func setVideoGravity(_ gravity: DYVideoGravity) {
+        assertMainThread()
         videoGravity = gravity
     }
     
     // MARK: - Private Methods
     
+    /// 断言当前在主线程调用（仅在 Debug 下生效）
+    /// 用于约束外部所有公开 API 必须在主线程使用
+    private func assertMainThread() {
+        assert(Thread.isMainThread, "DYVideoPlayer public APIs must be called on main thread")
+    }
+    
+    /// 更新播放器状态，并在状态变化时通过 delegate 通知外部
+    /// - Parameter newState: 新的状态
+    private func updateState(_ newState: DYPlayerState) {
+        let work = { [weak self] in
+            guard let self = self else { return }
+            guard self.state != newState else { return }
+            self.state = newState
+            self.delegate?.player(self, didChangeState: newState)
+        }
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
+    }
+    
+    /// 统一清理播放器资源和观察者的内部方法
+    /// - Parameter resetState: 是否重置状态为 idle 并触发回调
+    private func cleanupPlayerResources(resetState: Bool) {
+        removeObservers()
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
+        playerLayer?.removeFromSuperlayer()
+        player = nil
+        playerItem = nil
+        playerLayer = nil
+        containerView = nil
+        originalURLForRetry = nil
+        proxyURLForRetry = nil
+        hasRetriedWithOriginalURL = false
+        if resetState {
+            updateState(.idle)
+        }
+    }
+    
+    /// 配置音频会话，保证在静音模式下也能播放
     private func setupAudioSession() {
         // 允许在静音模式下播放声音
         do {
@@ -244,6 +343,8 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
             print("AudioSession setup failed: \(error)")
         }
     }
+    
+    /// 将自定义的 DYVideoGravity 映射为系统 AVLayerVideoGravity
     private func avGravity(from gravity: DYVideoGravity) -> AVLayerVideoGravity {
         switch gravity {
         case .aspectFit: return .resizeAspect
@@ -251,6 +352,8 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
         case .resize: return .resize
         }
     }
+    
+    /// 根据当前 videoGravity 更新 playerLayer 的填充模式和 frame
     private func updatePlayerLayerGravity() {
         guard let layer = playerLayer else { return }
         layer.videoGravity = avGravity(from: videoGravity)
@@ -263,6 +366,7 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
         }
     }
     
+    /// 为当前 player / item 添加 KVO、进度和结束通知监听
     private func addObservers() {
         guard let player = player, let item = playerItem else { return }
         
@@ -293,6 +397,7 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
         NotificationCenter.default.addObserver(self, selector: #selector(playerDidFinishPlaying), name: .AVPlayerItemDidPlayToEndTime, object: item)
     }
     
+    /// 移除所有已添加的观察者与通知监听
     private func removeObservers() {
         if let timeObserver = timeObserver {
             player?.removeTimeObserver(timeObserver)
@@ -313,6 +418,8 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
     
     // MARK: - Event Handlers
     
+    /// 处理 AVPlayerItem.status 变化
+    /// - Parameter status: 最新的播放项状态
     private func handleStatusChange(_ status: AVPlayerItem.Status) {
         switch status {
         case .readyToPlay:
@@ -361,9 +468,25 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
             
         case .failed:
             let errorMsg = playerItem?.error?.localizedDescription ?? "Unknown error"
-            state = .error(errorMsg)
-            DispatchQueue.main.async {
-                self.delegate?.player(self, didFailWithError: self.playerItem?.error)
+            if let originalURL = originalURLForRetry,
+               hasRetriedWithOriginalURL == false {
+                hasRetriedWithOriginalURL = true
+                let currentTime = self.currentTime
+                let targetContainer = self.containerView
+                DispatchQueue.main.async {
+                    VideoCacheManager.shared.addToBlacklist(url: originalURL)
+                    if let container = targetContainer {
+                        self.play(url: originalURL, in: container, seekTo: currentTime)
+                    } else {
+                        self.updateState(.error(errorMsg))
+                        self.delegate?.player(self, didFailWithError: self.playerItem?.error)
+                    }
+                }
+            } else {
+                updateState(.error(errorMsg))
+                DispatchQueue.main.async {
+                    self.delegate?.player(self, didFailWithError: self.playerItem?.error)
+                }
             }
             
         case .unknown:
@@ -373,25 +496,29 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
         }
     }
     
+    /// 处理 AVPlayer.timeControlStatus 变化（播放、暂停、缓冲）
+    /// - Parameter status: 播放控制状态
     private func handleTimeControlStatus(_ status: AVPlayer.TimeControlStatus) {
         switch status {
         case .paused:
             // 只有不是播放完成状态时，才切换为 paused
             if state != .finished && state != .idle {
-                state = .paused
+                updateState(.paused)
             }
         case .waitingToPlayAtSpecifiedRate:
             // 缓冲中
             if state != .idle && state != .preparing {
-                state = .buffering
+                updateState(.buffering)
             }
         case .playing:
-            state = .playing
+            updateState(.playing)
         @unknown default:
             break
         }
     }
     
+    /// 处理缓冲进度更新
+    /// - Parameter item: 当前播放项
     private func handleBufferUpdate(_ item: AVPlayerItem) {
         guard let timeRange = item.loadedTimeRanges.first?.timeRangeValue else { return }
         let start = timeRange.start.seconds
@@ -407,6 +534,8 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
         }
     }
     
+    /// 处理播放进度更新
+    /// - Parameter time: 当前播放时间（CMTime）
     private func handleTimeUpdate(_ time: CMTime) {
         guard let item = playerItem else { return }
         let current = time.seconds
@@ -418,8 +547,10 @@ public class DYVideoPlayer: NSObject, DYVideoPlayerInput {
         }
     }
     
+    /// 播放完成回调（由通知触发）
+    /// 负责更新状态、回调 delegate，并在 isLooping 开启时自动循环播放
     @objc private func playerDidFinishPlaying() {
-        state = .finished
+        updateState(.finished)
         DispatchQueue.main.async {
             self.delegate?.playerDidFinishPlaying(self)
         }

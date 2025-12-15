@@ -1,7 +1,7 @@
 import UIKit
 import SnapKit
 
-/// 播放器控制视图代理
+/// 播放器控制视图代理，负责向外暴露进度拖拽、播放控制等交互事件
 public protocol DYPlayerControlViewDelegate: AnyObject {
     /// 进度条拖拽开始
     func controlViewDidBeginDragging(_ controlView: DYPlayerControlView)
@@ -13,32 +13,62 @@ public protocol DYPlayerControlViewDelegate: AnyObject {
     func controlViewDidTapPlayPause(_ controlView: DYPlayerControlView)
     /// 点击全屏观看
     func controlViewDidTapFullscreen(_ controlView: DYPlayerControlView)
+    /// 长按开始加速播放
+    func controlViewDidBeginFastPlay(_ controlView: DYPlayerControlView)
+    /// 长按结束加速播放
+    func controlViewDidEndFastPlay(_ controlView: DYPlayerControlView)
 }
 
+/// 提供可选实现的默认空实现，使调用方只需实现关心的方法
 public extension DYPlayerControlViewDelegate {
+    /// 默认空实现：进度条拖拽开始
     func controlViewDidBeginDragging(_ controlView: DYPlayerControlView) {}
+    /// 默认空实现：进度条拖拽过程中的值变化
     func controlView(_ controlView: DYPlayerControlView, didChangeValue value: Double) {}
+    /// 默认空实现：点击全屏观看按钮
     func controlViewDidTapFullscreen(_ controlView: DYPlayerControlView) {}
+    /// 默认空实现：长按开始倍速播放
+    func controlViewDidBeginFastPlay(_ controlView: DYPlayerControlView) {}
+    /// 默认空实现：长按结束恢复正常播放
+    func controlViewDidEndFastPlay(_ controlView: DYPlayerControlView) {}
 }
 
-/// 播放器控制视图 (进度条、暂停按钮等)
+/// 播放器控制视图 (进度条、暂停按钮、错误覆盖层等)
 public class DYPlayerControlView: UIView {
     
     // MARK: - Properties
     
+    /// 控制视图的渲染状态快照，通过 Diff 渲染避免重复 UI 更新
+    private struct ViewState {
+        /// 播放器当前状态 (播放中、暂停、缓冲、错误等)
+        var playerState: DYPlayerState = .idle
+        /// 是否处于加载中，决定是否展示加载动画
+        var isLoading: Bool = false
+        /// 视频宽高比 (用于决定是否展示全屏按钮等)
+        var aspectRatio: Double?
+        /// 是否允许显示“全屏观看”按钮
+        var isFullscreenButtonEnabled: Bool = false
+        /// 当前是否已经处于全屏播放
+        var isFullScreen: Bool = false
+    }
+    
+    /// 控制视图代理，负责接收用户交互事件并转发给外部
     public weak var delegate: DYPlayerControlViewDelegate?
     
+    /// 是否正在拖拽进度条，拖拽中时不会自动更新进度条位置
     private var isDragging: Bool = false
-    private var isLoading: Bool = false
-    public enum DYControlPlayState { case preparing, playing, notPlaying, error }
-    private var currentState: DYControlPlayState = .notPlaying
+    /// 是否处于长按加速播放状态
     private var isFastPlaying: Bool = false
-    private var aspectRatio: Double?
-    private var isFullscreenButtonEnabled: Bool = false
+    /// 当前渲染状态
+    private var viewState = ViewState()
+    /// 延迟隐藏错误覆盖层的任务，用于避免频繁闪烁
+    private var errorOverlayPendingWorkItem: DispatchWorkItem?
+    /// 长按加速播放时展示的提示视图
     private lazy var speedTipView: ShortPlayerSpeedTipView = {
         let tipView = ShortPlayerSpeedTipView()
         return tipView
     }()
+    /// “全屏观看”按钮，仅在竖屏且满足条件时显示
     private lazy var fullscreenButton: UIButton = {
         let button = UIButton(type: .system)
         button.setTitle("全屏观看", for: .normal)
@@ -60,7 +90,7 @@ public class DYPlayerControlView: UIView {
         return view
     }()
     
-    /// 浮动时间标签 (拖拽时显示)
+    /// 浮动时间标签 (拖拽时显示当前/总时长)
     private lazy var floatingTimeLabel: UILabel = {
         let label = UILabel()
         label.textColor = .white
@@ -75,14 +105,14 @@ public class DYPlayerControlView: UIView {
         return label
     }()
     
-    /// 进度条
+    /// 视频播放进度条，支持拖拽和缓冲进度展示
     private lazy var progressBar: VideoProgressBar = {
         let bar = VideoProgressBar()
         bar.progressColor = .white
         bar.bufferColor = UIColor.white.withAlphaComponent(0.5)
         bar.trackColor = UIColor.white.withAlphaComponent(0.2)
         
-        // 绑定回调
+        /// 绑定进度条交互回调，将拖拽事件透传给外部代理
         bar.didBeginDragging = { [weak self] in
             guard let self = self else { return }
             self.isDragging = true
@@ -105,7 +135,7 @@ public class DYPlayerControlView: UIView {
         return bar
     }()
     
-    /// 屏幕中央的播放图标 (暂停时显示)
+    /// 屏幕中央的播放图标 (暂停或缓冲时显示)
     private lazy var centerPlayIcon: UIImageView = {
         let imageView = UIImageView(image: UIImage(systemName: "play.fill"))
         imageView.contentMode = .scaleAspectFit
@@ -128,6 +158,7 @@ public class DYPlayerControlView: UIView {
     
     // MARK: - UI Setup
     
+    /// 初始化并布局子视图，绑定手势与约束
     private func setupUI() {
         addSubview(bottomContainerView)
         addSubview(centerPlayIcon)
@@ -183,83 +214,53 @@ public class DYPlayerControlView: UIView {
     
     // MARK: - Actions
     
+    /// 点击播放/暂停按钮时回调给外部
     @objc private func playPauseTapped() {
         delegate?.controlViewDidTapPlayPause(self)
     }
     
+    /// 处理长按手势：按下开始进入倍速播放，松开恢复
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
-        let player = DYPlayerManager.shared.player
         switch gesture.state {
         case .began, .changed:
             if !isFastPlaying {
-                if player.state != .playing {
-                    player.resume()
-                }
-                player.setPlaybackRate(2.0)
                 isFastPlaying = true
+                delegate?.controlViewDidBeginFastPlay(self)
             }
             speedTipView.showSpeedView(tip: "2倍速")
         case .ended, .cancelled, .failed:
-            player.setPlaybackRate(1.0)
             isFastPlaying = false
+            delegate?.controlViewDidEndFastPlay(self)
             speedTipView.hideSpeedView()
         default:
             break
         }
     }
 
+    /// 点击“全屏观看”按钮时回调给外部
     @objc private func fullscreenTapped() {
         delegate?.controlViewDidTapFullscreen(self)
     }
     
     // MARK: - Public Methods
     
-    /// 更新播放播放按钮状态 (UI)
-    /// - Parameter isPlaying: 是否正在播放
-
-    public func updateCenterBtnState(_ state: DYControlPlayState) {
-        currentState = state
-        switch state {
-            //页面刚加载时候
-        case .preparing:
-            errorOverlayView.isHidden = true
-            centerPlayIcon.isHidden = true
-            updateFullscreenVisibility()
-        case .playing:
-            errorOverlayView.isHidden = true
-            UIView.animate(withDuration: 0.2) {
-                self.centerPlayIcon.alpha = 0
-            } completion: { _ in
-                self.centerPlayIcon.isHidden = true
-                self.centerPlayIcon.alpha = 1
-            }
-        case .notPlaying:
-            errorOverlayView.isHidden = true
-            centerPlayIcon.alpha = 0
-            centerPlayIcon.isHidden = false
-            UIView.animate(withDuration: 0.2) {
-                self.centerPlayIcon.alpha = 1
-            }
-            updateFullscreenVisibility()
-        case .error:
-            centerPlayIcon.isHidden = true
-            errorOverlayView.isHidden = false
-            fullscreenButton.isHidden = true
+    /// 更新中央播放按钮展示的播放器状态
+    /// - Parameter state: 播放器当前状态
+    public func updateCenterBtnState(_ state: DYPlayerState) {
+        applyViewState { viewState in
+            viewState.playerState = state
         }
     }
 
+    /// 更新加载状态，控制加载动画与错误覆盖层
+    /// - Parameter isLoading: 是否正在加载
     public func updateLoading(isLoading: Bool) {
-        self.isLoading = isLoading
-        if isLoading {
-            centerPlayIcon.isHidden = true
-            progressBar.startLoading()
-            errorOverlayView.isHidden = true
-        } else {
-            progressBar.finishLoading()
+        applyViewState { viewState in
+            viewState.isLoading = isLoading
         }
     }
     
-    /// 更新进度
+    /// 更新播放进度和拖拽时的浮动时间展示
     /// - Parameters:
     ///   - currentTime: 当前时间
     ///   - totalTime: 总时间
@@ -283,38 +284,113 @@ public class DYPlayerControlView: UIView {
         progressBar.updateBuffer(to: CGFloat(progress))
     }
 
+    /// 更新视频宽高比和是否展示全屏按钮
+    /// - Parameters:
+    ///   - ratio: 视频宽高比，nil 表示未知
+    ///   - shouldShowFullscreenButton: 是否允许显示全屏按钮
     public func updateAspectRatio(_ ratio: Double?, shouldShowFullscreenButton: Bool? = nil) {
-        aspectRatio = ratio
-        if let shouldShowFullscreenButton = shouldShowFullscreenButton {
-            isFullscreenButtonEnabled = shouldShowFullscreenButton
+        applyViewState { viewState in
+            viewState.aspectRatio = ratio
+            if let shouldShowFullscreenButton = shouldShowFullscreenButton {
+                viewState.isFullscreenButtonEnabled = shouldShowFullscreenButton
+            }
         }
-        updateFullscreenVisibility()
     }
     
+    /// 更新当前是否处于全屏状态
+    /// - Parameter isFullScreen: 是否为全屏
     public func updateFullscreenState(isFullScreen: Bool) {
-        fullscreenButton.isHidden = isFullScreen
-        if !isFullScreen {
-            updateFullscreenVisibility()
+        applyViewState { viewState in
+            viewState.isFullScreen = isFullScreen
         }
     }
     
     // MARK: - Private Helper
     
+    /// 更新内部 ViewState 并进行 Diff 渲染
+    /// - Parameter update: 对状态的修改闭包
+    private func applyViewState(_ update: (inout ViewState) -> Void) {
+        let oldState = viewState
+        update(&viewState)
+        render(old: oldState, new: viewState)
+    }
+    
+    /// 控制浮动时间标签的显隐
+    /// - Parameter show: 是否显示
     private func showFloatingTime(_ show: Bool) {
         UIView.animate(withDuration: 0.2) {
             self.floatingTimeLabel.alpha = show ? 1 : 0
         }
     }
 
-    private func updateFullscreenVisibility() {
-        guard isFullscreenButtonEnabled else {
-            fullscreenButton.isHidden = true
-            return
+    /// 根据新旧 ViewState 渲染 UI，避免不必要的刷新
+    /// - Parameters:
+    ///   - old: 旧状态
+    ///   - new: 新状态
+    private func render(old: ViewState, new: ViewState) {
+        if new.isLoading != old.isLoading {
+            if new.isLoading {
+                centerPlayIcon.isHidden = true
+                progressBar.startLoading()
+                errorOverlayView.isHidden = true
+            } else {
+                progressBar.finishLoading()
+            }
         }
-        fullscreenButton.isHidden = currentState == .playing
-        if !fullscreenButton.isHidden { bringSubviewToFront(fullscreenButton) }
+        
+        if new.playerState != old.playerState {
+            errorOverlayPendingWorkItem?.cancel()
+            errorOverlayPendingWorkItem = nil
+            
+            switch new.playerState {
+            case .error:
+                centerPlayIcon.isHidden = true
+                errorOverlayView.isHidden = false
+                fullscreenButton.isHidden = true
+            case .playing:
+                scheduleHideErrorOverlay()
+                UIView.animate(withDuration: 0.2) {
+                    self.centerPlayIcon.alpha = 0
+                } completion: { _ in
+                    self.centerPlayIcon.isHidden = true
+                    self.centerPlayIcon.alpha = 1
+                }
+            case .idle, .preparing, .finished:
+                scheduleHideErrorOverlay()
+                centerPlayIcon.isHidden = true
+            case .buffering, .paused:
+                scheduleHideErrorOverlay()
+                centerPlayIcon.alpha = 0
+                centerPlayIcon.isHidden = false
+                UIView.animate(withDuration: 0.2) {
+                    self.centerPlayIcon.alpha = 1
+                }
+            }
+        }
+        
+        let canShowFullscreenButton = new.isFullscreenButtonEnabled && !new.isFullScreen
+        let shouldShowFullscreenButton = canShowFullscreenButton && !new.playerState.isError
+        
+        fullscreenButton.isHidden = !shouldShowFullscreenButton
+        if !fullscreenButton.isHidden {
+            bringSubviewToFront(fullscreenButton)
+        }
     }
     
+    /// 延迟隐藏错误覆盖层，防止频繁闪烁
+    private func scheduleHideErrorOverlay() {
+        errorOverlayPendingWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.errorOverlayView.isHidden = true
+        }
+        errorOverlayPendingWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: workItem)
+    }
+    
+    /// 更新拖拽时显示的浮动时间文案
+    /// - Parameters:
+    ///   - currentTime: 当前时间
+    ///   - totalTime: 总时长
     private func updateFloatingTime(currentTime: Double, totalTime: Double) {
         let currentStr = formatTime(seconds: currentTime)
         let totalStr = formatTime(seconds: totalTime)
@@ -332,6 +408,9 @@ public class DYPlayerControlView: UIView {
         floatingTimeLabel.attributedText = attributedString
     }
     
+    /// 将秒数格式化为 `mm:ss` 字符串
+    /// - Parameter seconds: 秒数
+    /// - Returns: 格式化后的时间字符串
     private func formatTime(seconds: Double) -> String {
         guard !seconds.isNaN && !seconds.isInfinite else { return "00:00" }
         let secs = Int(seconds)
@@ -340,6 +419,7 @@ public class DYPlayerControlView: UIView {
         return String(format: "%02d:%02d", minutes, secondsValue)
     }
 
+    /// 错误覆盖层视图，用于展示“加载错误”等提示
     private lazy var errorOverlayView: UIView = {
         let view = UIView()
         view.backgroundColor = UIColor.black.withAlphaComponent(0.6)

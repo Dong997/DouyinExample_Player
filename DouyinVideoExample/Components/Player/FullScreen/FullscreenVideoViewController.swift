@@ -12,6 +12,8 @@ class FullscreenVideoViewController: UIViewController {
     private let currentTime: TimeInterval
     /// 视频宽高比，用于按比例扩展布局
     private let aspectRatio: Double?
+    /// 播放器依赖，由外部注入
+    private var player: DYVideoAdvancedControlInput
     /// 全屏时支持的屏幕方向，默认横屏
     private let fullscreenOrientationMask: UIInterfaceOrientationMask
     /// 退出全屏时的回调，用于通知外部恢复状态
@@ -106,11 +108,13 @@ class FullscreenVideoViewController: UIViewController {
         videoURL: URL,
         currentTime: TimeInterval,
         aspectRatio: Double?,
-        fullscreenOrientationMask: UIInterfaceOrientationMask = .landscapeRight
+        fullscreenOrientationMask: UIInterfaceOrientationMask = .landscapeRight,
+        player: DYVideoAdvancedControlInput
     ) {
         self.videoURL = videoURL
         self.currentTime = currentTime
         self.aspectRatio = aspectRatio
+        self.player = player
         self.fullscreenOrientationMask = fullscreenOrientationMask
         super.init(nibName: nil, bundle: nil)
         self.modalPresentationStyle = .fullScreen
@@ -143,7 +147,9 @@ class FullscreenVideoViewController: UIViewController {
         view.addGestureRecognizer(singleTapGesture)
         view.addGestureRecognizer(doubleTapGesture)
         centerPlayButton.addTarget(self, action: #selector(handleCenterPlayButtonTapped), for: .touchUpInside)
-        DYPlayerManager.shared.player.delegate = self
+        player.delegate = self
+        currentSpeed = player.playbackRate
+        updateSpeedButtonTitle()
         playVideo()
         scheduleControlsAutoHide()
     }
@@ -161,6 +167,11 @@ class FullscreenVideoViewController: UIViewController {
     /// 视图即将消失，此处预留扩展
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+    }
+    
+    /// 全屏播放时隐藏底部 Home Indicator（指示条）
+    override var prefersHomeIndicatorAutoHidden: Bool {
+        return true
     }
 
     /// 返回全屏播放时支持的屏幕方向
@@ -222,8 +233,8 @@ class FullscreenVideoViewController: UIViewController {
         
         controlsContainerView.addSubview(closeButton)
         closeButton.snp.makeConstraints { make in
-            make.leading.equalTo(view.safeAreaLayoutGuide.snp.leading).offset(16)
-            make.top.equalTo(view.safeAreaLayoutGuide.snp.top).offset(8)
+            make.leading.equalToSuperview().offset(16)
+            make.top.equalToSuperview().offset(8)
             make.width.height.equalTo(32)
         }
         
@@ -236,12 +247,12 @@ class FullscreenVideoViewController: UIViewController {
     
     /// 在播放器容器中开始播放当前视频
     private func playVideo() {
-        DYPlayerManager.shared.play(url: videoURL, in: playerContainerView, seekTo: currentTime)
-        DYPlayerManager.shared.player.videoGravity = .aspectFit
+        DYPlayerManager.shared.playWithCache(originalURL: videoURL, in: playerContainerView, seekTo: currentTime)
+        player.videoGravity = .aspectFit
     }
     
     @objc private func handleClose() {
-        dismiss(animated: false) { [weak self] in
+        dismiss(animated: true) { [weak self] in
             self?.onDismiss?()
         }
     }
@@ -258,20 +269,18 @@ extension FullscreenVideoViewController {
         }
         progressBar.didChangeProgress = { [weak self] progress in
             guard let self = self else { return }
-            let player = DYPlayerManager.shared.player
-            let totalTime = player.duration
+            let totalTime = self.player.duration
             let currentTime = Double(progress) * totalTime
             self.updateTimeLabel(currentTime: currentTime, totalTime: totalTime)
         }
         progressBar.didEndDragging = { [weak self] progress in
             guard let self = self else { return }
             self.isDraggingProgress = false
-            let player = DYPlayerManager.shared.player
-            let totalTime = player.duration
+            let totalTime = self.player.duration
             let targetTime = Double(progress) * totalTime
-            player.seek(to: targetTime) { finished in
+            self.player.seek(to: targetTime) { finished in
                 if finished {
-                    player.resume()
+                    self.player.resume()
                 }
             }
             self.scheduleControlsAutoHide()
@@ -334,6 +343,11 @@ extension FullscreenVideoViewController {
             scheduleControlsAutoHide()
         }
     }
+
+    private func updateSpeedButtonTitle() {
+        let title = String(format: "%.2fx", currentSpeed)
+        speedButton.setTitle(title, for: .normal)
+    }
     
     /// 处理具体倍速选项点击，更新播放器播放倍速
     /// - Parameter sender: 被点击的倍速按钮
@@ -342,9 +356,9 @@ extension FullscreenVideoViewController {
         guard index >= 0, index < speedOptions.count else { return }
         let selectedSpeed = speedOptions[index]
         currentSpeed = selectedSpeed
+        updateSpeedButtonTitle()
         isSpeedSelectorVisible = false
         speedSelectorContainerView.isHidden = true
-        let player = DYPlayerManager.shared.player
         player.setPlaybackRate(currentSpeed)
         scheduleControlsAutoHide()
     }
@@ -352,7 +366,6 @@ extension FullscreenVideoViewController {
     /// 处理长按手势，提供临时 2 倍速播放能力
     /// - Parameter gesture: 长按手势实例
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
-        let player = DYPlayerManager.shared.player
         switch gesture.state {
         case .began, .changed:
             if !isFastPlayingByLongPress {
@@ -379,8 +392,7 @@ extension FullscreenVideoViewController {
     private func showControls(animated: Bool) {
         areControlsVisible = true
         controlsContainerView.isUserInteractionEnabled = true
-        let playerState = DYPlayerManager.shared.player.state
-        updateCenterPlayButtonForPlayerState(playerState)
+        updateCenterPlayButtonForPlayerState(player.state)
         let animations = {
             self.controlsContainerView.alpha = 1.0
         }
@@ -436,7 +448,6 @@ extension FullscreenVideoViewController {
     /// 双击手势回调：控制播放/暂停
     /// - Parameter gesture: 双击手势实例
     @objc private func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
-        let player = DYPlayerManager.shared.player
         if player.state == .playing {
             player.pause()
         } else {
@@ -448,7 +459,6 @@ extension FullscreenVideoViewController {
     
     /// 中间播放按钮点击回调，切换播放/暂停状态
     @objc private func handleCenterPlayButtonTapped() {
-        let player = DYPlayerManager.shared.player
         if player.state == .playing {
             player.pause()
         } else {

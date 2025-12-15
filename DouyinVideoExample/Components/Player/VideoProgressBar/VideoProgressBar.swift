@@ -7,15 +7,35 @@
 
 import UIKit
 
+/// 拖拽开始回调，适用于通知外部开始 Seek 或更新 UI
+typealias VideoProgressBarDragStartHandler = () -> Void
+/// 拖拽过程中进度变更回调，参数为 0~1 的归一化进度
+typealias VideoProgressBarProgressChangeHandler = (CGFloat) -> Void
+/// 拖拽结束回调，参数为最终归一化进度
+typealias VideoProgressBarDragEndHandler = (CGFloat) -> Void
+
+/// 进度条交互模式
+/// - interactive: 支持用户拖拽和点击
+/// - displayOnly: 仅展示进度，不响应触摸事件
+enum VideoProgressBarInteractionMode {
+    case interactive
+    case displayOnly
+}
+
+/// 通用视频进度条组件
+/// 支持：缓冲进度展示、拖拽 Seek、加载动画、父滚动视图联动
 class VideoProgressBar: UIView {
 
     // MARK: - 自定义颜色
+    /// 轨道底色
     var trackColor: UIColor = UIColor.gray.withAlphaComponent(0.4) {
         didSet { trackLayer.backgroundColor = trackColor.cgColor }
     }
+    /// 缓冲进度条颜色
     var bufferColor: UIColor = UIColor.gray.withAlphaComponent(0.7) {
         didSet { bufferLayer.backgroundColor = bufferColor.cgColor }
     }
+    /// 已播放进度条与拖拽圆点颜色
     var progressColor: UIColor = .white {
         didSet {
             progressLayer.backgroundColor = progressColor.cgColor
@@ -24,33 +44,57 @@ class VideoProgressBar: UIView {
         }
     }
     
-    /// 是否开启拖拽时放大效果
+    /// 是否在拖拽时放大进度条高度
     var enableScaleAnimation: Bool = true
+    /// 是否在 0~5% 范围内关闭进度动画，避免首屏抖动
     var disableAnimationForZeroToFivePercent: Bool = false
+    /// 当前组件的交互模式
+    var interactionMode: VideoProgressBarInteractionMode = .interactive
+    /// 外部注入父滚动视图解析逻辑，用于控制滚动冲突处理
+    var scrollViewResolver: ((VideoProgressBar) -> UIScrollView?)?
+    /// 是否启用播放进度动画
+    var isProgressAnimationEnabled: Bool = true
+    /// 是否启用缓冲进度动画
+    var isBufferAnimationEnabled: Bool = true
+    /// 触发进度动画的最小进度差阈值
+    var progressAnimationMinDelta: CGFloat = 0.01
+    /// 触发缓冲动画的最小进度差阈值
+    var bufferAnimationMinDelta: CGFloat = 0.02
     
     // MARK: - Private
+    /// 底部轨道图层
     private let trackLayer = CALayer()
+    /// 缓冲进度图层
     private let bufferLayer = CALayer()
+    /// 播放进度图层
     private let progressLayer = CALayer()
-    private let loadingLayer = CALayer() // 专门用于加载动画的图层
+    /// 加载动画图层
+    private let loadingLayer = CALayer()
+    /// 拖拽圆点图层
     private let thumbLayer = CALayer()
 
+    /// 当前播放进度（0~1）
     private var currentProgress: CGFloat = 0
+    /// 当前缓冲进度（0~1）
     private var currentBuffer: CGFloat = 0
     
+    /// 加载动画使用的 Key
     private let loadingAnimationKey = "loadingAnimation"
 
     // MARK: - Initialization
+    /// 代码初始化入口
     override init(frame: CGRect) {
         super.init(frame: frame)
         setupLayers()
     }
 
+    /// 不支持从 XIB/Storyboard 初始化
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         setupLayers()
     }
 
+    /// 构建内部图层结构与默认外观
     private func setupLayers() {
         layer.cornerRadius = 0
         layer.masksToBounds = false
@@ -80,27 +124,39 @@ class VideoProgressBar: UIView {
 
     // MARK: - Touch Handling
     
-    // 进度回调
-    var didBeginDragging: (() -> Void)?
-    var didChangeProgress: ((CGFloat) -> Void)?
-    var didEndDragging: ((CGFloat) -> Void)?
+    /// 拖拽开始回调
+    var didBeginDragging: VideoProgressBarDragStartHandler?
+    /// 拖拽中进度变更回调
+    var didChangeProgress: VideoProgressBarProgressChangeHandler?
+    /// 拖拽结束回调
+    var didEndDragging: VideoProgressBarDragEndHandler?
     
+    /// 是否处于用户拖拽交互中
     private var isInteracting: Bool = false
+    /// 标记当前进度更新是否来源于触摸，避免循环回调
     private var isUpdatingFromTouch: Bool = false
+    /// 拖拽结束后的缓冲稳定期标记，用于忽略瞬时大跳动
     private var isSettlingAfterDrag: Bool = false
+    /// 稳定期定时器
     private var settleTimer: Timer?
     
-    // 扩大点击响应范围 (上下各扩大 20pt)
+    /// 扩大点击区域并在展示模式下关闭交互
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        if interactionMode == .displayOnly {
+            return false
+        }
         let touchArea = bounds.insetBy(dx: 0, dy: -30)
         return touchArea.contains(point)
     }
     
+    /// 触摸开始：进入拖拽态，放大进度条并禁用父滚动
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesBegan(touches, with: event)
+        if interactionMode == .displayOnly {
+            return
+        }
         isInteracting = true
-        // 禁止父视图滚动 (解决手势冲突)
-        parentScrollView?.isScrollEnabled = false
+        resolvedScrollView?.isScrollEnabled = false
         
         // 放大动画
         if enableScaleAnimation {
@@ -113,16 +169,20 @@ class VideoProgressBar: UIView {
         handleTouch(touches)
     }
     
+    /// 触摸移动：持续更新归一化进度
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesMoved(touches, with: event)
         handleTouch(touches)
     }
     
+    /// 触摸结束：恢复滚动和尺寸，触发最终 Seek 回调
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesEnded(touches, with: event)
+        if interactionMode == .displayOnly {
+            return
+        }
         isInteracting = false
-        // 恢复父视图滚动
-        parentScrollView?.isScrollEnabled = true
+        resolvedScrollView?.isScrollEnabled = true
         
         // 恢复大小
         if enableScaleAnimation {
@@ -140,11 +200,14 @@ class VideoProgressBar: UIView {
         didEndDragging?(currentProgress)
     }
     
+    /// 触摸取消：与结束逻辑一致，保证状态恢复
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesCancelled(touches, with: event)
+        if interactionMode == .displayOnly {
+            return
+        }
         isInteracting = false
-        // 恢复父视图滚动
-        parentScrollView?.isScrollEnabled = true
+        resolvedScrollView?.isScrollEnabled = true
         
         // 恢复大小
         if enableScaleAnimation {
@@ -161,6 +224,7 @@ class VideoProgressBar: UIView {
         didEndDragging?(currentProgress)
     }
     
+    /// 将触摸位置映射为 0~1 的归一化进度并透传给回调
     private func handleTouch(_ touches: Set<UITouch>) {
         guard let touch = touches.first else { return }
         let point = touch.location(in: self)
@@ -171,7 +235,15 @@ class VideoProgressBar: UIView {
         didChangeProgress?(progress)
     }
     
-    // MARK: - Helper
+    /// 解析需要被禁用滚动的父滚动视图
+    private var resolvedScrollView: UIScrollView? {
+        if let resolver = scrollViewResolver {
+            return resolver(self)
+        }
+        return parentScrollView
+    }
+    
+    /// 从 superview 链中查找最近的 UIScrollView
     private var parentScrollView: UIScrollView? {
         var view = self.superview
         while view != nil {
@@ -184,6 +256,7 @@ class VideoProgressBar: UIView {
     }
     
     // MARK: - Layout
+    /// 布局子图层并在尺寸变化时更新进度和加载动画
     override func layoutSubviews() {
         super.layoutSubviews()
         trackLayer.frame = bounds
@@ -230,17 +303,17 @@ class VideoProgressBar: UIView {
 
     }
     
-    /// 更新播放进度 (0.0 to 1.0)
+    /// 更新播放进度 (0.0 ~ 1.0)
     /// - Parameters:
-    ///   - progress: 播放进度值
-    ///   - animated: 是否需要动画效果
+    ///   - progress: 归一化播放进度
+    ///   - animated: 是否启用动画（仍受内部开关与阈值控制）
     public func updateProgress(to progress: CGFloat, animated: Bool = true) {
         let bounded = max(0, min(1, progress))
         if isInteracting && !isUpdatingFromTouch { return }
+        let delta = abs(bounded - currentProgress)
         var disableAnimationOnce = false
         if isSettlingAfterDrag && !isUpdatingFromTouch {
-            let diff = abs(bounded - currentProgress)
-            if diff > 0.02 { return }
+            if delta > 0.02 { return }
             isSettlingAfterDrag = false
             settleTimer?.invalidate()
             disableAnimationOnce = true
@@ -256,7 +329,11 @@ class VideoProgressBar: UIView {
         let updateAction = {
             self.updateProgressFrame()
         }
-        let effectiveAnimated = animated && !disableAnimationOnce && !disableLowRangeAnimation
+        let effectiveAnimated = animated
+            && isProgressAnimationEnabled
+            && !disableAnimationOnce
+            && !disableLowRangeAnimation
+            && delta >= progressAnimationMinDelta
         if effectiveAnimated {
             UIView.animate(withDuration: 0.25, animations: updateAction)
         } else {
@@ -267,17 +344,27 @@ class VideoProgressBar: UIView {
         }
     }
 
-    /// 更新缓冲进度 (0.0 to 1.0)
+    /// 更新缓冲进度 (0.0 ~ 1.0)
     public func updateBuffer(to buffer: CGFloat) {
-        currentBuffer = max(0, min(1, buffer))
-        
-        UIView.animate(withDuration: 0.25) {
-            self.updateBufferFrame()
+        let bounded = max(0, min(1, buffer))
+        let delta = abs(bounded - currentBuffer)
+        currentBuffer = bounded
+        let shouldAnimate = isBufferAnimationEnabled && delta >= bufferAnimationMinDelta
+        if shouldAnimate {
+            UIView.animate(withDuration: 0.25) {
+                self.updateBufferFrame()
+            }
+        } else {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            updateBufferFrame()
+            CATransaction.commit()
         }
     }
     
     // MARK: - private Methods
 
+    /// 启动加载动画图层的缩放往复动画
     private func startLoadingAnimation() {
         loadingLayer.removeAllAnimations()
 
@@ -292,15 +379,18 @@ class VideoProgressBar: UIView {
         loadingLayer.add(animation, forKey: loadingAnimationKey)
     }
     
+    /// 根据 currentProgress 更新播放进度图层和圆点位置
     private func updateProgressFrame() {
         progressLayer.frame = CGRect(x: 0, y: 0, width: bounds.width * currentProgress, height: bounds.height)
         updateThumbFrame()
     }
     
+    /// 根据 currentBuffer 更新缓冲进度图层
     private func updateBufferFrame() {
         bufferLayer.frame = CGRect(x: 0, y: 0, width: bounds.width * currentBuffer, height: bounds.height)
     }
     
+    /// 根据当前进度和高度计算拖拽圆点的几何位置与圆角
     private func updateThumbFrame() {
         let width = bounds.width
         let height = bounds.height

@@ -5,7 +5,11 @@ import Foundation
 /// 完全与具体播放器解耦，只依赖 URL
 public class VideoPreloadManager {
     
+    /// 全局单例访问入口
     public static let shared = VideoPreloadManager()
+    
+    /// 是否启用自适应预加载策略预留开关，目前仅作为配置占位
+    public var isAdaptivePreloadEnabled: Bool = false
     
     /// 向后预加载数量
     public var preloadNextCount: Int = 1
@@ -19,7 +23,50 @@ public class VideoPreloadManager {
     /// 当前正在预加载的 URL 集合 (用于避免重复操作)
     private var preloadingUrls: Set<URL> = []
     
-    private init() {}
+    /// 发起预加载请求的总次数（不含命中缓存的情况）
+    public private(set) var totalPreloadRequests: Int = 0
+    /// 预加载完成的总次数
+    public private(set) var totalPreloadCompleted: Int = 0
+    /// 预加载失败的总次数
+    public private(set) var totalPreloadFailed: Int = 0
+    /// 命中已缓存资源的次数（无需再次预加载）
+    public private(set) var totalPreloadHits: Int = 0
+    
+    /// 预加载命中率：命中缓存次数 / (命中缓存 + 实际请求)
+    public var cacheHitRate: Double {
+        let denominator = Double(totalPreloadRequests + totalPreloadHits)
+        if denominator == 0 {
+            return 0
+        }
+        return Double(totalPreloadHits) / denominator
+    }
+    
+    /// 预加载成功率：完成次数 / 请求次数
+    public var preloadSuccessRate: Double {
+        if totalPreloadRequests == 0 {
+            return 0
+        }
+        return Double(totalPreloadCompleted) / Double(totalPreloadRequests)
+    }
+    
+    /// 预加载失败率：失败次数 / 请求次数
+    public var preloadFailureRate: Double {
+        if totalPreloadRequests == 0 {
+            return 0
+        }
+        return Double(totalPreloadFailed) / Double(totalPreloadRequests)
+    }
+    
+    /// 用于监听 VideoCacheManager 发出的预加载通知
+    private let notificationCenter: NotificationCenter
+    
+    /// 私有化构造函数，确保通过 shared 访问
+    /// - Parameter notificationCenter: 注入的通知中心，默认使用系统默认中心
+    private init(notificationCenter: NotificationCenter = .default) {
+        self.notificationCenter = notificationCenter
+        notificationCenter.addObserver(self, selector: #selector(handlePreloadFinished(_:)), name: .videoCacheManagerPreloadFinished, object: nil)
+        notificationCenter.addObserver(self, selector: #selector(handlePreloadFailed(_:)), name: .videoCacheManagerPreloadFailed, object: nil)
+    }
     
     // MARK: - Public Methods
     
@@ -78,7 +125,10 @@ public class VideoPreloadManager {
         let urlsToStart = targetPreloadURLs.subtracting(preloadingUrls)
         for url in urlsToStart {
             // 如果已经完全缓存了，就不需要预加载了 (VideoCacheManager 可能不暴露这个状态，最好检查一下)
-            if !VideoCacheManager.shared.isFullyCached(for: url) {
+            if VideoCacheManager.shared.isFullyCached(for: url) {
+                totalPreloadHits += 1
+            } else {
+                totalPreloadRequests += 1
                 VideoCacheManager.shared.preload(url: url, length: preloadSize)
             }
         }
@@ -101,5 +151,15 @@ public class VideoPreloadManager {
     /// 清理指定 URL 的缓存
     public func clearCache(for url: URL) {
         VideoCacheManager.shared.clearCache(for: url)
+    }
+    
+    /// 处理预加载完成通知，累加成功计数
+    @objc private func handlePreloadFinished(_ notification: Notification) {
+        totalPreloadCompleted += 1
+    }
+    
+    /// 处理预加载失败通知，累加失败计数
+    @objc private func handlePreloadFailed(_ notification: Notification) {
+        totalPreloadFailed += 1
     }
 }
