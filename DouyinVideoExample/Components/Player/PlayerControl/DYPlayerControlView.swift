@@ -61,6 +61,8 @@ public class DYPlayerControlView: UIView {
     private var isFastPlaying: Bool = false
     /// 当前渲染状态
     private var viewState = ViewState()
+
+    private var totalDuration: Double = 0
     /// 延迟隐藏错误覆盖层的任务，用于避免频繁闪烁
     private var errorOverlayPendingWorkItem: DispatchWorkItem?
     /// 长按加速播放时展示的提示视图
@@ -122,6 +124,8 @@ public class DYPlayerControlView: UIView {
         
         bar.didChangeProgress = { [weak self] progress in
             guard let self = self else { return }
+            let currentTime = Double(progress) * self.totalDuration
+            self.updateFloatingTime(currentTime: currentTime, totalTime: self.totalDuration)
             self.delegate?.controlView(self, didChangeValue: Double(progress))
         }
         
@@ -265,6 +269,7 @@ public class DYPlayerControlView: UIView {
     ///   - currentTime: 当前时间
     ///   - totalTime: 总时间
     public func updateProgress(currentTime: Double, totalTime: Double) {
+        self.totalDuration = totalTime
         // 如果正在拖拽，不更新进度条位置，以免跳动
         if !isDragging {
             if totalTime > 0 {

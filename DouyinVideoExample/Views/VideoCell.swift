@@ -71,7 +71,7 @@ class VideoCell: UICollectionViewCell {
     func configure(with model: VideoModel) {
         titleLabel.text = model.title
         
-        controlView.updateAspectRatio(model.aspectRatio, shouldShowFullscreenButton: model.aspectRatio ?? 0 > 1.0)
+        
         // 使用 Kingfisher 加载图片
         // 之前的手动加载方式容易出现线程安全问题和内存访问错误 (EXC_BAD_ACCESS)
         // Kingfisher 内部处理了线程切换、缓存和生命周期管理，更加安全稳定

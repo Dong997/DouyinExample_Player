@@ -13,7 +13,7 @@ struct VideoModel {
         
         // 安全构造 VideoModel 对象
         if let coverURL1 = URL(string: "https://img0.baidu.com/it/u=2414272732,2400080964&fm=253&app=138&f=JPEG?w=800&h=1422"),
-           let videoURL1 = URL(string: "https://video.app.visionlinkmedia.cn/rongmeiti/vod/2022/12/26/d67f79cc981348fd9c271eb7b3cf101e/h264_500k_mp4.mp4") {
+           let videoURL1 = URL(string: "https://1309962417.vod-qcloud.com/4dd6dc2cvodcq1309962417/e0df88925145403710955125013/f0.mp4") {
             videos.append(VideoModel(id: "1", title: "风景视频1", coverURL: coverURL1, videoURL: videoURL1))
         }
         
