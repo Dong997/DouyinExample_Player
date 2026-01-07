@@ -75,18 +75,23 @@ class VideoCell: UICollectionViewCell {
         // 使用 Kingfisher 加载图片
         // 之前的手动加载方式容易出现线程安全问题和内存访问错误 (EXC_BAD_ACCESS)
         // Kingfisher 内部处理了线程切换、缓存和生命周期管理，更加安全稳定
-//        if let url = model.coverURL {
-//            coverImageView.kf.setImage(
-//                with: url,
-//                placeholder: nil,
-//                options: [
-//                    .transition(.fade(0.2)),
-//                    .cacheOriginalImage
-//                ]
-//            )
-//        } else {
-//            coverImageView.image = nil
-//        }
+        // if let url = model.coverURL {
+        //     coverImageView.kf.setImage(
+        //         with: url,
+        //         placeholder: nil,
+        //         options: [
+        //             .transition(.fade(0.2)),
+        //             .cacheOriginalImage
+        //         ]
+        //     )
+        // } else {
+        //     coverImageView.image = nil
+        // }
+        
+        // 更新视频宽高比，决定是否显示全屏按钮
+        // 只有横屏视频 (宽高比 > 1) 才显示全屏按钮
+        let isHorizontal = (model.aspectRatio ?? 0) > 1.0
+        controlView.updateAspectRatio(model.aspectRatio, shouldShowFullscreenButton: isHorizontal)
     }
     
     override func prepareForReuse() {
