@@ -7,6 +7,7 @@ class DetailViewController: UIViewController {
 
     private let videoURL: URL
     private let seekTime: TimeInterval
+    private var hasTakenOverPlayer: Bool = false
     
     // Container for the video player
     let videoContainerView: UIView = {
@@ -61,9 +62,16 @@ class DetailViewController: UIViewController {
         view.backgroundColor = .black
         setupUI()
         setupActions()
+    }
+    
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        takeOverPlayerIfNeeded()
         
-        // 首次进入时接管播放器
-        setupPlayer()
+        let player = DYPlayerManager.shared.player
+        if player.containerView == videoContainerView {
+            player.updatePlayerFrame(videoContainerView.bounds)
+        }
     }
     
     override func viewWillAppear(_ animated: Bool) {
@@ -72,24 +80,40 @@ class DetailViewController: UIViewController {
         // 页面出现时（包括从下一级返回），检查并恢复播放器
         let player = DYPlayerManager.shared.player
         if player.containerView != videoContainerView {
-            setupPlayer()
+            hasTakenOverPlayer = false
+            takeOverPlayerIfNeeded()
         }
     }
     
-    private func setupPlayer() {
+    private func takeOverPlayerIfNeeded() {
+        if hasTakenOverPlayer {
+            return
+        }
+        
+        if videoContainerView.bounds.isEmpty {
+            return
+        }
+        
         let player = DYPlayerManager.shared.player
-        let isSameVideo = (player.originalURL == videoURL) || (player.currentURL == videoURL)
+        let isSameVideo: Bool
+        if let originalURL = player.originalURL {
+            isSameVideo = originalURL == videoURL
+        } else if let currentURL = player.currentURL {
+            isSameVideo = currentURL == videoURL
+        } else {
+            isSameVideo = false
+        }
         
         if isSameVideo {
-            // 无缝衔接：直接移动 layer
             player.updateContainer(videoContainerView)
             if player.state != .playing {
                 player.resume()
             }
         } else {
-            // 不同视频：重新播放，并跳转到指定时间
-            DYPlayerManager.shared.play(url: videoURL, in: videoContainerView, seekTo: seekTime)
+            DYPlayerManager.shared.playWithCache(originalURL: videoURL, in: videoContainerView, seekTo: seekTime)
         }
+        
+        hasTakenOverPlayer = true
     }
     
     override func viewWillDisappear(_ animated: Bool) {

@@ -294,6 +294,15 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         assertMainThread()
         videoGravity = gravity
     }
+
+    public func updatePlayerFrame(_ frame: CGRect) {
+        assertMainThread()
+        guard let layer = playerLayer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.frame = frame
+        CATransaction.commit()
+    }
     
     // MARK: - Private Methods
     
