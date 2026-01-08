@@ -64,4 +64,18 @@ struct VideoModel {
         
         return videos
     }
+    
+    static func moreData() -> [VideoModel] {
+        var videos: [VideoModel] = []
+        if let coverURL10 = URL(string: "https://img2.baidu.com/it/u=172332305,310833579&fm=253&fmt=auto&app=138&f=JPEG?w=500&h=889"),
+           let videoURL10 = URL(string: "https://video.app.visionlinkmedia.cn/rongmeiti/vod/2026/01/08/fe6c0a3e21a84b8e9f5c27ac133f64cd/h264_500k_mp4.mp4") {
+            videos.append(VideoModel(id: "11", title: "跳转后的视频1", coverURL: coverURL10, videoURL: videoURL10))
+        }
+        
+        if let coverURL11 = URL(string: "https://img2.baidu.com/it/u=172332305,310833579&fm=253&fmt=auto&app=138&f=JPEG?w=500&h=889"),
+           let videoURL11 = URL(string: "https://video.app.visionlinkmedia.cn/rongmeiti/vod/2026/01/08/0c90ec72be3448bd92781b09621515ad/h264_500k_mp4.mp4") {
+            videos.append(VideoModel(id: "12", title: "跳转后的视频2", coverURL: coverURL11, videoURL: videoURL11))
+        }
+        return videos
+    }
 }

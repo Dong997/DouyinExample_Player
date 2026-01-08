@@ -23,7 +23,11 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 通过 play(url:in:) 或 updateContainer(_:) 更新
     public private(set) weak var containerView: UIView?
     
+    /// 当前正在播放的视频 URL (play 调用时传入)
+    public private(set) var currentURL: URL?
+    
     /// 当前播放的原始视频地址（用于缓存失败时降级重试）
+    public var originalURL: URL? { return originalURLForRetry }
     private var originalURLForRetry: URL?
     
     /// 当前播放的代理视频地址（由缓存代理生成）
@@ -122,6 +126,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         assertMainThread()
         let previousContainer = containerView
         stop()
+        self.currentURL = url
         self.pendingSeekTime = seekTo
         var playerItem: AVPlayerItem
         playerItem = AVPlayerItem(url: url)
@@ -263,7 +268,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
             view.layer.insertSublayer(layer, at: UInt32(sublayers.count))
         }
         
-        print("Player container updated, new frame: \(view.bounds), gravity: \(videoGravity)")
+//        print("Player container updated, new frame: \(view.bounds), gravity: \(videoGravity)")
         containerView = view
         if previousContainer !== view {
             delegate?.player(self, didChangeContainerFrom: previousContainer, to: view)
@@ -325,6 +330,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         playerItem = nil
         playerLayer = nil
         containerView = nil
+        currentURL = nil
         originalURLForRetry = nil
         proxyURLForRetry = nil
         hasRetriedWithOriginalURL = false

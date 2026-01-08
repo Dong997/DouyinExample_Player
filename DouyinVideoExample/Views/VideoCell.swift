@@ -34,9 +34,13 @@ class VideoCell: UICollectionViewCell {
     // Player Control View
     let controlView = DYPlayerControlView()
     
+    // Callback when title is tapped
+    var onTitleTapped: (() -> Void)?
+    
     override init(frame: CGRect) {
         super.init(frame: frame)
         setupUI()
+        setupActions()
     }
     
     required init?(coder: NSCoder) {
@@ -66,6 +70,16 @@ class VideoCell: UICollectionViewCell {
             make.leading.trailing.equalToSuperview().inset(16)
             make.bottom.equalToSuperview().offset(-60) // Leave space for bottom tab bar if any, or safe area
         }
+    }
+    
+    private func setupActions() {
+        titleLabel.isUserInteractionEnabled = true
+        let tapGesture = UITapGestureRecognizer(target: self, action: #selector(titleTapped))
+        titleLabel.addGestureRecognizer(tapGesture)
+    }
+    
+    @objc private func titleTapped() {
+        onTitleTapped?()
     }
     
     func configure(with model: VideoModel) {
@@ -98,6 +112,7 @@ class VideoCell: UICollectionViewCell {
         super.prepareForReuse()
         coverImageView.image = nil
         controlView.delegate = nil
+        onTitleTapped = nil
         controlView.updateProgress(currentTime: 0, totalTime: 0)
         controlView.updateCenterBtnState(.preparing)
     }

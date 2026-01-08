@@ -55,8 +55,17 @@ class HomeViewController: UIViewController {
         // 设置播放器代理
         DYPlayerManager.shared.player.delegate = self
         
+        // 启用侧滑返回手势
+        navigationController?.interactivePopGestureRecognizer?.delegate = self
+        navigationController?.interactivePopGestureRecognizer?.isEnabled = true
+        
         setupUI()
         bindViewModel()
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        checkAndRestorePlayer()
     }
 
     override func viewDidLayoutSubviews() {
@@ -72,14 +81,60 @@ class HomeViewController: UIViewController {
     
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        // 暂不需要在此处特殊处理全屏跳转逻辑，因为 Window 模式下 HomeViewController 不会触发 viewWillDisappear (除非被系统回收或 Tab 切换)
-        // 如果需要更精细的控制，可以监听 Window 的状态
-        DYPlayerManager.shared.pause()
+        // 只有当播放器还在当前页面（是 collectionView 的子视图）时才暂停
+        // 如果已经跳转到详情页，播放器已经被详情页接管（containerView 变了），此时不应暂停
+        let player = DYPlayerManager.shared.player
+        if let container = player.containerView, container.isDescendant(of: collectionView) {
+            player.pause()
+        }
     }
     
     // MARK: - Orientation Support
     
     // MARK: - Private Methods
+    
+    private func checkAndRestorePlayer() {
+        guard let indexPath = currentPlayingIndexPath,
+              let cell = collectionView.cellForItem(at: indexPath) as? VideoCell,
+              viewModel.videos.indices.contains(indexPath.item) else {
+            return
+        }
+        
+        let video = viewModel.videos[indexPath.item]
+        let player = DYPlayerManager.shared.player
+        
+        // 恢复代理 (防止详情页修改了代理)
+        player.delegate = self
+        
+        // 检查播放器是否被挪用（容器不一致）
+        if player.containerView !== cell.playerContainerView {
+            // 判断是否是同一个视频
+            let isSameVideo: Bool
+            if let original = player.originalURL {
+                isSameVideo = (original == video.videoURL)
+            } else if let current = player.currentURL {
+                isSameVideo = (current == video.videoURL)
+            } else {
+                isSameVideo = false
+            }
+            
+            if isSameVideo {
+                // 1. 同视频：无缝拿回播放器
+                player.updateContainer(cell.playerContainerView)
+                if player.state != .playing {
+                    player.resume()
+                }
+            } else {
+                // 2. 不同视频：重新加载当前视频
+                playVideo(at: indexPath)
+            }
+        } else {
+            // 容器一致，仅确保恢复播放
+            if player.state != .playing {
+                player.resume()
+            }
+        }
+    }
     
     private func setupUI() {
         view.addSubview(bottomBar)
@@ -159,6 +214,14 @@ class HomeViewController: UIViewController {
         cell.controlView.delegate = self
         cell.controlView.updateProgress(currentTime: 0, totalTime: 0)
         cell.controlView.updateCenterBtnState(.preparing)
+        
+        // 点击标题跳转详情页
+        cell.onTitleTapped = { [weak self] in
+            guard let self = self else { return }
+            let currentTime = DYPlayerManager.shared.player.currentTime
+            let detailVC = DetailViewController(videoURL: video.videoURL, seekTime: currentTime)
+            self.navigationController?.pushViewController(detailVC, animated: true)
+        }
         
         // 使用缓存代理播放，如果代理失败会自动降级为原始 URL
         if video.resumeTime > 0 {
@@ -345,5 +408,13 @@ extension HomeViewController: DYPlayerControlViewDelegate {
     func controlViewDidEndFastPlay(_ controlView: DYPlayerControlView) {
         let player = DYPlayerManager.shared.player
         player.setPlaybackRate(1.0)
+    }
+}
+
+// MARK: - UIGestureRecognizerDelegate
+extension HomeViewController: UIGestureRecognizerDelegate {
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        // 只有当导航栈中控制器数量大于1时，才允许手势，防止在根控制器卡死
+        return (navigationController?.viewControllers.count ?? 0) > 1
     }
 }
