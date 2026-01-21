@@ -6,6 +6,7 @@ target 'DouyinVideoExample' do
   pod 'KTVHTTPCache', '~> 3.0.0'
   pod 'SnapKit'
   pod 'NVActivityIndicatorView'
+  pod 'TXLiteAVSDK_Player'
   pod 'Kingfisher'
 end
 
