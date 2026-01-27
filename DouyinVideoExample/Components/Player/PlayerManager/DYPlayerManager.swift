@@ -21,7 +21,8 @@ public class DYPlayerManager: NSObject {
     
     public func playWithCache(originalURL: URL, in view: UIView, seekTo: TimeInterval? = nil) {
         let proxyURL = VideoCacheManager.shared.getProxyURL(for: originalURL)
-        player.playWithCache(originalURL: originalURL, proxyURL: proxyURL, in: view, seekTo: seekTo)
+        // 传递 originalURL 以便后续重试逻辑使用
+        player.play(url: proxyURL, originalURL: originalURL, in: view, seekTo: seekTo)
     }
     
     /// 暂停

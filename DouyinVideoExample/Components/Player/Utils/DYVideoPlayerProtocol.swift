@@ -114,9 +114,10 @@ public protocol DYVideoPlayerInput {
     /// 播放指定URL的视频
     /// - Parameters:
     ///   - url: 视频URL
+    ///   - originalURL: 原始视频URL (可选，用于元数据记录或重试逻辑对比)
     ///   - view: 承载视频画面的父视图
     ///   - seekTo: 起始播放时间
-    func play(url: URL, in view: UIView, seekTo: TimeInterval?)
+    func play(url: URL, originalURL: URL?, in view: UIView, seekTo: TimeInterval?)
     
     /// 暂停播放
     func pause()

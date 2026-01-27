@@ -268,7 +268,7 @@ class VideoProgressBar: UIView {
         trackLayer.cornerRadius = bounds.height / 2
         CATransaction.commit()
         updateBufferFrame()
-        updateProgressFrame()
+        updateProgressFrame(animated: false)
         loadingLayer.frame = CGRect(x: 0, y: 0, width: bounds.width / 1.5, height: bounds.height)
         loadingLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
         
@@ -329,22 +329,12 @@ class VideoProgressBar: UIView {
             }
         }
         currentProgress = bounded
-        let updateAction = {
-            self.updateProgressFrame()
-        }
         let effectiveAnimated = animated
             && isProgressAnimationEnabled
             && !disableAnimationOnce
             && !disableLowRangeAnimation
             && delta >= progressAnimationMinDelta
-        if effectiveAnimated {
-            UIView.animate(withDuration: 0.25, animations: updateAction)
-        } else {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            updateAction()
-            CATransaction.commit()
-        }
+        updateProgressFrame(animated: effectiveAnimated)
     }
 
     /// 更新缓冲进度 (0.0 ~ 1.0)
@@ -354,9 +344,12 @@ class VideoProgressBar: UIView {
         currentBuffer = bounded
         let shouldAnimate = isBufferAnimationEnabled && delta >= bufferAnimationMinDelta
         if shouldAnimate {
-            UIView.animate(withDuration: 0.25) {
-                self.updateBufferFrame()
-            }
+            CATransaction.begin()
+            CATransaction.setDisableActions(false)
+            CATransaction.setAnimationDuration(0.25)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .linear))
+            updateBufferFrame()
+            CATransaction.commit()
         } else {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
@@ -383,9 +376,22 @@ class VideoProgressBar: UIView {
     }
     
     /// 根据 currentProgress 更新播放进度图层和圆点位置
-    private func updateProgressFrame() {
-        progressLayer.frame = CGRect(x: 0, y: 0, width: bounds.width * currentProgress, height: bounds.height)
-        updateThumbFrame()
+    private func updateProgressFrame(animated: Bool = false) {
+        if animated {
+            CATransaction.begin()
+            CATransaction.setDisableActions(false)
+            CATransaction.setAnimationDuration(0.25)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .linear))
+            progressLayer.frame = CGRect(x: 0, y: 0, width: bounds.width * currentProgress, height: bounds.height)
+            updateThumbFrame(animated: true)
+            CATransaction.commit()
+        } else {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            progressLayer.frame = CGRect(x: 0, y: 0, width: bounds.width * currentProgress, height: bounds.height)
+            updateThumbFrame(animated: false)
+            CATransaction.commit()
+        }
     }
     
     /// 根据 currentBuffer 更新缓冲进度图层
@@ -394,7 +400,7 @@ class VideoProgressBar: UIView {
     }
     
     /// 根据当前进度和高度计算拖拽圆点的几何位置与圆角
-    private func updateThumbFrame() {
+    private func updateThumbFrame(animated: Bool = false) {
         let width = bounds.width
         let height = bounds.height
         guard width > 0, height > 0 else {
@@ -409,10 +415,15 @@ class VideoProgressBar: UIView {
         let originX = clampedCenterX - diameter / 2
         let originY = (height - diameter) / 2
         
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        thumbLayer.frame = CGRect(x: originX, y: originY, width: diameter, height: diameter)
-        thumbLayer.cornerRadius = diameter / 2
-        CATransaction.commit()
+        if animated {
+            thumbLayer.frame = CGRect(x: originX, y: originY, width: diameter, height: diameter)
+            thumbLayer.cornerRadius = diameter / 2
+        } else {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            thumbLayer.frame = CGRect(x: originX, y: originY, width: diameter, height: diameter)
+            thumbLayer.cornerRadius = diameter / 2
+            CATransaction.commit()
+        }
     }
 }

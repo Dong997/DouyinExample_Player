@@ -27,15 +27,8 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 当前正在播放的视频 URL (play 调用时传入)
     public private(set) var currentURL: URL?
     
-    /// 当前播放的原始视频地址（用于缓存失败时降级重试）
-    public var originalURL: URL? { return originalURLForRetry }
-    private var originalURLForRetry: URL?
-    
-    /// 当前播放的代理视频地址（由缓存代理生成）
-    private var proxyURLForRetry: URL?
-    
-    /// 是否已经从代理 URL 降级为原始 URL 进行过一次重试
-    private var hasRetriedWithOriginalURL: Bool = false
+    /// 当前播放的原始视频地址（可选，仅作记录，用于外部比对）
+    public private(set) var originalURL: URL?
     
     /// 是否静音
     public var isMuted: Bool = false {
@@ -133,19 +126,12 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     
     // MARK: - Public Methods
     
-    public func playWithCache(originalURL: URL, proxyURL: URL, in view: UIView, seekTo: TimeInterval? = nil) {
-        assertMainThread()
-        originalURLForRetry = originalURL
-        proxyURLForRetry = proxyURL
-        hasRetriedWithOriginalURL = false
-        play(url: proxyURL, in: view, seekTo: seekTo)
-    }
-    
-    public func play(url: URL, in view: UIView, seekTo: TimeInterval? = nil) {
+    public func play(url: URL, originalURL: URL? = nil, in view: UIView, seekTo: TimeInterval? = nil) {
         assertMainThread()
         let previousContainer = containerView
         stop()
         self.currentURL = url
+        self.originalURL = originalURL
         self.pendingSeekTime = seekTo
         
         DispatchQueue.main.async {
@@ -379,9 +365,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         
         containerView = nil
         currentURL = nil
-        originalURLForRetry = nil
-        proxyURLForRetry = nil
-        hasRetriedWithOriginalURL = false
+        originalURL = nil
         if resetState {
             updateState(.idle)
         }
@@ -534,25 +518,11 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
             
         case .failed:
             let errorMsg = playerItem?.error?.localizedDescription ?? "Unknown error"
-            if let originalURL = originalURLForRetry,
-               hasRetriedWithOriginalURL == false {
-                hasRetriedWithOriginalURL = true
-                let currentTime = self.currentTime
-                let targetContainer = self.containerView
-                DispatchQueue.main.async {
-                    VideoCacheManager.shared.addToBlacklist(url: originalURL)
-                    if let container = targetContainer {
-                        self.play(url: originalURL, in: container, seekTo: currentTime)
-                    } else {
-                        self.updateState(.error(errorMsg))
-                        self.delegate?.player(self, didFailWithError: self.playerItem?.error)
-                    }
-                }
-            } else {
-                updateState(.error(errorMsg))
-                DispatchQueue.main.async {
-                    self.delegate?.player(self, didFailWithError: self.playerItem?.error)
-                }
+            // 移除内部自动重试逻辑，直接上报错误
+            // 重试策略由外部（如 PlaybackRetryHandler）接管
+            updateState(.error(errorMsg))
+            DispatchQueue.main.async {
+                self.delegate?.player(self, didFailWithError: self.playerItem?.error)
             }
             
         case .unknown:

@@ -7,8 +7,10 @@ class HomeViewController: UIViewController {
     // MARK: - Properties
     
     private let viewModel = HomeViewModel()
+    private let retryHandler = PlaybackRetryHandler()
     private var cancellables = Set<AnyCancellable>()
     private var currentPlayingIndexPath: IndexPath?
+    private var isDraggingProgress = false
     private var fullscreenTransitioningDelegate: FullscreenVideoTransitioningDelegate?
     private let bottomBar: UIView = {
         let barView = UIView()
@@ -354,14 +356,20 @@ extension HomeViewController: DYVideoPlayerDelegate {
         guard let indexPath = currentPlayingIndexPath else { return }
         let video = viewModel.videos[indexPath.item]
         
-        print("[HomeViewController] Player error: \(String(describing: error)), retrying with original URL")
-        
-        // 1. 将该 URL 加入黑名单，避免后续再次使用代理
-        VideoCacheManager.shared.addToBlacklist(url: video.videoURL)
-        
-        // 2. 使用原始 URL 重试播放
-        // 注意：playVideo 内部调用 getProxyURL 时，会因为黑名单而直接返回原始 URL
-        playVideo(at: indexPath)
+        // 使用 PlaybackRetryHandler 决定是否重试以及重试的 URL
+        if let currentURL = player.currentURL,
+           let retryURL = retryHandler.shouldRetry(for: error, currentURL: currentURL, originalURL: video.videoURL) {
+            
+            print("[HomeViewController] Retrying with URL: \(retryURL)")
+            // 重新播放（playVideo 内部会再次调用 DYPlayerManager，但由于已加入黑名单，这次会拿到原始 URL）
+            // 或者更直接地：
+            // DYPlayerManager.shared.play(url: retryURL, in: cell.playerContainerView)
+            // 但为了保持逻辑一致性（如 updateResumeTime 等），调用 playVideo 比较稳妥
+            playVideo(at: indexPath)
+            
+        } else {
+            print("[HomeViewController] Player error: \(String(describing: error)). No retry strategy matched.")
+        }
     }
 }
 
