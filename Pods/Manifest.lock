@@ -7,14 +7,12 @@ PODS:
     - NVActivityIndicatorView/Base (= 5.2.0)
   - NVActivityIndicatorView/Base (5.2.0)
   - SnapKit (5.7.1)
-  - TXLiteAVSDK_Player (13.0.20275)
 
 DEPENDENCIES:
   - Kingfisher
   - KTVHTTPCache (~> 3.0.0)
   - NVActivityIndicatorView
   - SnapKit
-  - TXLiteAVSDK_Player
 
 SPEC REPOS:
   trunk:
@@ -23,7 +21,6 @@ SPEC REPOS:
     - KTVHTTPCache
     - NVActivityIndicatorView
     - SnapKit
-    - TXLiteAVSDK_Player
 
 SPEC CHECKSUMS:
   CocoaAsyncSocket: 065fd1e645c7abab64f7a6a2007a48038fdc6a99
@@ -31,8 +28,7 @@ SPEC CHECKSUMS:
   KTVHTTPCache: 9e18fcc199609d7e2d5708c9b0184869a3dc993f
   NVActivityIndicatorView: fe52a6a68664c2df8991d7d9e3d86d8d19453c53
   SnapKit: d612e99e678a2d3b95bf60b0705ed0a35c03484a
-  TXLiteAVSDK_Player: b2b74df9b5b2d67afefaa30340a5fc77aef496bd
 
-PODFILE CHECKSUM: 212bd3e15db1a6141e7b592961a08ba9895412ae
+PODFILE CHECKSUM: a28518a606d5ba7e12b3b42bcdeba575df9c90d1
 
 COCOAPODS: 1.16.2
