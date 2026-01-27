@@ -118,7 +118,7 @@ public protocol DYVideoPlayerInput {
     ///   - seekTo: 起始播放时间
     func play(url: URL, in view: UIView, seekTo: TimeInterval?)
     
-    /// 暂停
+    /// 暂停播放
     func pause()
     
     /// 恢复播放
@@ -130,8 +130,9 @@ public protocol DYVideoPlayerInput {
     /// 跳转到指定时间
     /// - Parameters:
     ///   - time: 目标时间(秒)
+    ///   - isPrecise: 是否精确跳转 (默认 true)
     ///   - completion: 完成回调
-    func seek(to time: TimeInterval, completion: ((Bool) -> Void)?)
+    func seek(to time: TimeInterval, isPrecise: Bool, completion: ((Bool) -> Void)?)
 }
 
 public extension DYVideoPlayerInput {
@@ -142,7 +143,7 @@ public extension DYVideoPlayerInput {
     /// 跳转到指定时间
     /// - Parameter time: 目标时间(秒)
     func seek(to time: TimeInterval, completion: ((Bool) -> Void)? = nil){
-        seek(to: time, completion: completion)
+        seek(to: time, isPrecise: true, completion: completion)
     }
 }
 

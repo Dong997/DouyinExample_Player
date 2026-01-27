@@ -33,6 +33,7 @@ public class DYPlayerControlView: UIView {
     private var totalDuration: Double = 0
     /// 延迟隐藏错误覆盖层的任务，用于避免频繁闪烁
     private var errorOverlayPendingWorkItem: DispatchWorkItem?
+    private var pauseIconPendingWorkItem: DispatchWorkItem?
     /// 长按加速播放时展示的提示视图
     private lazy var speedTipView: ShortPlayerSpeedTipView = {
         let tipView = ShortPlayerSpeedTipView()
@@ -92,16 +93,19 @@ public class DYPlayerControlView: UIView {
         
         bar.didChangeProgress = { [weak self] progress in
             guard let self = self else { return }
-            let currentTime = Double(progress) * self.totalDuration
-            self.updateFloatingTime(currentTime: currentTime, totalTime: self.totalDuration)
-            self.delegate?.controlView(self, didChangeValue: Double(progress))
+            let time = Double(progress) * self.totalDuration
+            self.updateFloatingTime(currentTime: time, totalTime: self.totalDuration)
+            // 触发非精确 Seek (实时预览)
+            self.delegate?.controlView(self, didSeekTo: time, isPrecise: false)
         }
         
         bar.didEndDragging = { [weak self] progress in
             guard let self = self else { return }
             self.isDragging = false
             self.showFloatingTime(false)
-            self.delegate?.controlView(self, didEndDragging: Double(progress))
+            let time = Double(progress) * self.totalDuration
+            // 触发精确 Seek (最终定位)
+            self.delegate?.controlView(self, didSeekTo: time, isPrecise: true)
         }
         
         return bar
@@ -314,6 +318,8 @@ public class DYPlayerControlView: UIView {
         if new.playerState != old.playerState {
             errorOverlayPendingWorkItem?.cancel()
             errorOverlayPendingWorkItem = nil
+            pauseIconPendingWorkItem?.cancel()
+            pauseIconPendingWorkItem = nil
             
             switch new.playerState {
             case .error:
@@ -328,16 +334,21 @@ public class DYPlayerControlView: UIView {
                     self.centerPlayIcon.isHidden = true
                     self.centerPlayIcon.alpha = 1
                 }
-            case .idle, .preparing, .finished:
+            case .idle, .preparing, .finished, .buffering:
                 scheduleHideErrorOverlay()
                 centerPlayIcon.isHidden = true
-            case .buffering, .paused:
+            case .paused:
                 scheduleHideErrorOverlay()
-                centerPlayIcon.alpha = 0
-                centerPlayIcon.isHidden = false
-                UIView.animate(withDuration: 0.2) {
-                    self.centerPlayIcon.alpha = 1
+                let workItem = DispatchWorkItem { [weak self] in
+                    guard let self = self else { return }
+                    self.centerPlayIcon.alpha = 0
+                    self.centerPlayIcon.isHidden = false
+                    UIView.animate(withDuration: 0.2) {
+                        self.centerPlayIcon.alpha = 1
+                    }
                 }
+                pauseIconPendingWorkItem = workItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: workItem)
             }
         }
         

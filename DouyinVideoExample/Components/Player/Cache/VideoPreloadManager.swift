@@ -9,7 +9,7 @@ public class VideoPreloadManager {
     public static let shared = VideoPreloadManager()
     
     /// 是否启用自适应预加载策略预留开关，目前仅作为配置占位
-    public var isAdaptivePreloadEnabled: Bool = false
+    public var isAdaptivePreloadEnabled: Bool = true
     
     /// 向后预加载数量
     public var preloadNextCount: Int = 1
@@ -19,6 +19,11 @@ public class VideoPreloadManager {
     
     /// 单个视频预加载大小（字节），默认 2MB
     public var preloadSize: Int = 2 * 1024 * 1024
+    
+    private let minPreloadSize = 1 * 1024 * 1024 // 1MB
+    private let maxPreloadSize = 5 * 1024 * 1024 // 5MB
+    private var requestsSinceLastAdjustment = 0
+    private let adjustmentThreshold = 5 // 每 5 次请求尝试调整一次
     
     /// 当前正在预加载的 URL 集合 (用于避免重复操作)
     private var preloadingUrls: Set<URL> = []
@@ -156,10 +161,43 @@ public class VideoPreloadManager {
     /// 处理预加载完成通知，累加成功计数
     @objc private func handlePreloadFinished(_ notification: Notification) {
         totalPreloadCompleted += 1
+        checkAndAdjustPreloadSize()
     }
     
     /// 处理预加载失败通知，累加失败计数
     @objc private func handlePreloadFailed(_ notification: Notification) {
         totalPreloadFailed += 1
+        checkAndAdjustPreloadSize()
+    }
+    
+    /// 根据成功/失败率动态调整预加载大小
+    private func checkAndAdjustPreloadSize() {
+        guard isAdaptivePreloadEnabled else { return }
+        
+        requestsSinceLastAdjustment += 1
+        if requestsSinceLastAdjustment < adjustmentThreshold {
+            return
+        }
+        requestsSinceLastAdjustment = 0
+        
+        // 简单策略：失败率高则减小，成功率高则增加
+        // 注意：这里仅考虑最近的趋势可能会更好，但为了简单，先使用全局概率参考
+        // 实际生产中建议使用滑动窗口计算最近 N 次的成功率
+        
+        if preloadFailureRate > 0.2 {
+            // 失败率 > 20%，网络可能较差，减少预加载量
+            let newSize = max(minPreloadSize, preloadSize - 512 * 1024)
+            if newSize != preloadSize {
+                preloadSize = newSize
+                print("[VideoPreloadManager] Adaptive: Decreased preload size to \(preloadSize / 1024 / 1024)MB")
+            }
+        } else if preloadSuccessRate > 0.8 {
+            // 成功率 > 80%，网络状况良好，尝试增加预加载量
+            let newSize = min(maxPreloadSize, preloadSize + 512 * 1024)
+            if newSize != preloadSize {
+                preloadSize = newSize
+                print("[VideoPreloadManager] Adaptive: Increased preload size to \(preloadSize / 1024 / 1024)MB")
+            }
+        }
     }
 }

@@ -266,19 +266,25 @@ extension FullscreenVideoViewController {
             self.isDraggingProgress = true
             self.showControls(animated: true)
             self.cancelControlsAutoHide()
+            // 拖拽开始暂停播放，避免干扰
+            self.player.pause()
         }
         progressBar.didChangeProgress = { [weak self] progress in
             guard let self = self else { return }
             let totalTime = self.player.duration
             let currentTime = Double(progress) * totalTime
             self.updateTimeLabel(currentTime: currentTime, totalTime: totalTime)
+            
+            // 拖拽过程中实时 Seek (非精确)
+            self.player.seek(to: currentTime, isPrecise: false, completion: nil)
         }
         progressBar.didEndDragging = { [weak self] progress in
             guard let self = self else { return }
             self.isDraggingProgress = false
             let totalTime = self.player.duration
             let targetTime = Double(progress) * totalTime
-            self.player.seek(to: targetTime) { finished in
+            // 拖拽结束使用精确 Seek
+            self.player.seek(to: targetTime, isPrecise: true) { finished in
                 if finished {
                     self.player.resume()
                 }

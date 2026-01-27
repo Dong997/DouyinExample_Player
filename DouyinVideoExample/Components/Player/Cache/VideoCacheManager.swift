@@ -104,6 +104,9 @@ public class VideoCacheManager: NSObject {
     
     /// 初始化配置
     private func setupConfiguration() {
+        // 设置缓存限制 (最大 500MB)
+        KTVHTTPCache.cacheSetMaxCacheLength(500 * 1024 * 1024)
+        
         // 设置超时时间
         KTVHTTPCache.downloadSetTimeoutInterval(30)
         
@@ -119,7 +122,8 @@ public class VideoCacheManager: NSObject {
             "audio/mpeg",
             "audio/x-wav",
             "application/octet-stream",
-            "binary/octet-stream"
+            "binary/octet-stream",
+            "application/x-www-form-urlencoded"
         ]
         KTVHTTPCache.downloadSetAcceptableContentTypes(contentTypes)
         

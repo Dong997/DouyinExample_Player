@@ -4,8 +4,8 @@ import UIKit
 public protocol DYPlayerControlViewDelegate: AnyObject {
     /// 进度条拖拽开始
     func controlViewDidBeginDragging(_ controlView: DYPlayerControlView)
-    /// 进度条拖拽结束
-    func controlView(_ controlView: DYPlayerControlView, didEndDragging value: Double)
+    /// 用户 Seek 视频进度
+    func controlView(_ controlView: DYPlayerControlView, didSeekTo time: Double, isPrecise: Bool)
     /// 进度条值改变
     func controlView(_ controlView: DYPlayerControlView, didChangeValue value: Double)
     /// 点击暂停/播放按钮
@@ -22,6 +22,8 @@ public protocol DYPlayerControlViewDelegate: AnyObject {
 public extension DYPlayerControlViewDelegate {
     /// 默认空实现：进度条拖拽开始
     func controlViewDidBeginDragging(_ controlView: DYPlayerControlView) {}
+    /// 默认空实现：用户 Seek 视频进度
+    func controlView(_ controlView: DYPlayerControlView, didSeekTo time: Double, isPrecise: Bool) {}
     /// 默认空实现：进度条拖拽过程中的值变化
     func controlView(_ controlView: DYPlayerControlView, didChangeValue value: Double) {}
     /// 默认空实现：点击全屏观看按钮

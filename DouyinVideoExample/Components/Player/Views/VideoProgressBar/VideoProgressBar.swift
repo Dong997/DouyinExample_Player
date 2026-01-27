@@ -172,6 +172,9 @@ class VideoProgressBar: UIView {
     /// 触摸移动：持续更新归一化进度
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesMoved(touches, with: event)
+        if interactionMode == .displayOnly {
+            return
+        }
         handleTouch(touches)
     }
     

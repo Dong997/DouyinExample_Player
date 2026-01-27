@@ -38,4 +38,15 @@ public class DYPlayerManager: NSObject {
     public func stop() {
         player.stop()
     }
+    
+    /// 跳转到指定时间
+    /// - Parameters:
+    ///   - time: 目标时间 (秒)
+    ///   - isPrecise: 是否精确跳转。
+    ///     - true: 精确跳转 (tolerance = zero)，适用于用户停止拖拽后的最终定位。
+    ///     - false: 快速跳转 (tolerance = infinity)，适用于用户正在拖拽进度条时的实时预览，性能更好。
+    ///   - completion: 完成回调
+    public func seek(to time: TimeInterval, isPrecise: Bool = true, completion: ((Bool) -> Void)? = nil) {
+        player.seek(to: time, isPrecise: isPrecise, completion: completion)
+    }
 }

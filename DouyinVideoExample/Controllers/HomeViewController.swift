@@ -368,19 +368,20 @@ extension HomeViewController: DYVideoPlayerDelegate {
 // MARK: - DYPlayerControlViewDelegate
 extension HomeViewController: DYPlayerControlViewDelegate {
     
-    func controlView(_ controlView: DYPlayerControlView, didEndDragging value: Double) {
-        // 拖拽结束，进行 Seek
+    func controlViewDidBeginDragging(_ controlView: DYPlayerControlView) {
+        // 拖拽开始，暂停播放以避免冲突
+        DYPlayerManager.shared.player.pause()
+    }
+
+    func controlView(_ controlView: DYPlayerControlView, didSeekTo time: Double, isPrecise: Bool) {
         let player = DYPlayerManager.shared.player
-        let totalTime = player.duration
-        let targetTime = totalTime * value
-        
-        // Seek 操作
-        player.seek(to: targetTime) { [weak player] finished in
-            if finished {
-                player?.resume()
+        // 执行 Seek
+        player.seek(to: time, isPrecise: isPrecise) { finished in
+            // 只有在精确 Seek (拖拽结束) 且 Seek 成功后才恢复播放
+            if isPrecise && finished {
+                player.resume()
             }
         }
-        print("Seek to: \(targetTime)")
     }
     
     func controlViewDidTapPlayPause(_ controlView: DYPlayerControlView) {

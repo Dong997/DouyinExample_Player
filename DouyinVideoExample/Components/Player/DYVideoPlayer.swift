@@ -1,5 +1,6 @@
 import UIKit
 import AVFoundation
+import SnapKit
 
 /// 基于 AVPlayer 封装的短视频播放器组件
 /// 负责：
@@ -82,11 +83,27 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     
     // MARK: - Private Properties
     
+    /// 承载 AVPlayer 的视图 (封装了 AVPlayerLayer)
+    private lazy var playerView: DYPlayerView = {
+        let view = DYPlayerView()
+        view.videoGravity = avGravity(from: videoGravity)
+        return view
+    }()
+    
     private var player: AVPlayer?
     
-    private var playerItem: AVPlayerItem?
+    /// 用于无缝循环播放的 Looper
+    private var playerLooper: AVPlayerLooper?
     
-    private var playerLayer: AVPlayerLayer?
+    private var playerItem: AVPlayerItem? {
+        didSet {
+            // 当 playerItem 变化时，重新绑定监听
+            if oldValue !== playerItem {
+                removePlayerItemObservers(for: oldValue)
+                addPlayerItemObservers(for: playerItem)
+            }
+        }
+    }
     
     private var pendingSeekTime: TimeInterval?
     
@@ -99,6 +116,8 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     private var bufferObserver: NSKeyValueObservation?
     /// 播放控制状态 KVO（iOS 10+）
     private var timeControlStatusObserver: NSKeyValueObservation?
+    /// 当前播放项 KVO (用于 Looper 切换 Item 时更新)
+    private var currentItemObserver: NSKeyValueObservation?
     
     // MARK: - Initialization
     
@@ -128,48 +147,56 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         stop()
         self.currentURL = url
         self.pendingSeekTime = seekTo
-        var playerItem: AVPlayerItem
-        playerItem = AVPlayerItem(url: url)
-        self.playerItem = playerItem
-        let player = AVPlayer(playerItem: playerItem)
-        player.isMuted = isMuted
-        player.volume = volume
-
-
-        if #available(iOS 10.0, *) {
-            player.automaticallyWaitsToMinimizeStalling = false
-        }
-        self.player = player
-
+        
         DispatchQueue.main.async {
             view.layoutIfNeeded()
-
-            if let existingLayer = self.playerLayer, existingLayer.superlayer == view.layer {
-                existingLayer.removeFromSuperlayer()
+            self.playerView.removeFromSuperview()
+            view.addSubview(self.playerView)
+            self.playerView.snp.remakeConstraints { make in
+                make.edges.equalToSuperview()
             }
-
-            let layer = AVPlayerLayer(player: player)
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            layer.frame = view.bounds
-            CATransaction.commit()
-            layer.videoGravity = self.avGravity(from: self.videoGravity)
-            layer.isHidden = true
-
-            view.layer.sublayers?.forEach { sublayer in
-                if sublayer is AVPlayerLayer && sublayer != layer {
-                    sublayer.removeFromSuperlayer()
-                }
-            }
-
-            view.layer.addSublayer(layer)
-            self.playerLayer = layer
-            
-            self.addObservers()
+            self.playerView.isHidden = true
             self.updateState(.preparing)
             self.containerView = view
             if previousContainer !== view {
                 self.delegate?.player(self, didChangeContainerFrom: previousContainer, to: view)
+            }
+        }
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            let asset = AVURLAsset(url: url)
+            let keys = ["playable"]
+            asset.loadValuesAsynchronously(forKeys: keys) { [weak self] in
+                guard let self = self else { return }
+                var error: NSError?
+                let status = asset.statusOfValue(forKey: "playable", error: &error)
+                if status == .loaded && asset.isPlayable {
+                    let initialItem = AVPlayerItem(asset: asset)
+                    DispatchQueue.main.async {
+                        if self.isLooping {
+                            let queuePlayer = AVQueuePlayer(playerItem: initialItem)
+                            self.playerLooper = AVPlayerLooper(player: queuePlayer, templateItem: initialItem)
+                            self.player = queuePlayer
+                        } else {
+                            self.player = AVPlayer(playerItem: initialItem)
+                        }
+                        self.playerItem = initialItem
+                        guard let player = self.player else { return }
+                        player.isMuted = self.isMuted
+                        player.volume = self.volume
+                        if #available(iOS 10.0, *) {
+                            player.automaticallyWaitsToMinimizeStalling = false
+                        }
+                        self.playerView.player = player
+                        self.addPlayerObservers()
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        let message = error?.localizedDescription ?? "Asset not playable"
+                        self.updateState(.error(message))
+                        self.delegate?.player(self, didFailWithError: error)
+                    }
+                }
             }
         }
     }
@@ -207,7 +234,14 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         cleanupPlayerResources(resetState: true)
     }
     
-    public func seek(to time: TimeInterval, completion: ((Bool) -> Void)? = nil) {
+    /// 跳转到指定时间
+    /// - Parameters:
+    ///   - time: 目标时间 (秒)
+    ///   - isPrecise: 是否精确跳转。
+    ///     - true: 精确跳转 (tolerance = zero)，适用于用户停止拖拽后的最终定位。
+    ///     - false: 快速跳转 (tolerance = infinity)，适用于用户正在拖拽进度条时的实时预览，性能更好。
+    ///   - completion: 完成回调
+    public func seek(to time: TimeInterval, isPrecise: Bool = true, completion: ((Bool) -> Void)? = nil) {
         assertMainThread()
         guard let player = player else {
             completion?(false)
@@ -215,60 +249,56 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         }
         
         let cmTime = CMTime(seconds: time, preferredTimescale: 600)
-        player.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
-            completion?(finished)
+        
+        if isPrecise {
+            player.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+                completion?(finished)
+            }
+        } else {
+            // 使用 positiveInfinity 允许播放器跳转到最近的关键帧，极大提升拖拽流畅度
+            player.seek(to: cmTime, toleranceBefore: .positiveInfinity, toleranceAfter: .positiveInfinity) { finished in
+                completion?(finished)
+            }
         }
     }
     
     /// 更新播放器承载视图 (用于全屏切换)
-    /// 会将当前 AVPlayerLayer 从旧 view 移动到新的 view 上
+    /// 会将当前 PlayerView 从旧 view 移动到新的 view 上
     /// 并通过 delegate 通知 container 变更
     public func updateContainer(_ view: UIView) {
         assertMainThread()
         let previousContainer = containerView
-        guard let layer = playerLayer else {
-            print("Warning: playerLayer is nil, cannot update container")
-            return
-        }
         
         // 确保 view 的布局已更新
         view.layoutIfNeeded()
         
-        // 如果 layer 已经在目标容器中，只需要更新 frame 和 gravity
-        if layer.superlayer == view.layer {
-            // 已经在目标容器中，更新 frame 和确保 gravity 正确
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            layer.frame = view.bounds
-            layer.videoGravity = avGravity(from: videoGravity)
-            CATransaction.commit()
-            layer.isHidden = false
-            print("Player container frame updated, new frame: \(view.bounds), gravity: \(videoGravity)")
+        // 如果 playerView 已经在目标容器中
+        if playerView.superview == view {
+            // 更新约束（虽然 SnapKit 的 edges.equalToSuperview 通常自动适应，但重新 ensure 一下也没错）
+            playerView.snp.remakeConstraints { make in
+                make.edges.equalToSuperview()
+            }
+            playerView.videoGravity = avGravity(from: videoGravity)
+            playerView.isHidden = false
             return
         }
         
-        // 移除旧的 layer
-        layer.removeFromSuperlayer()
+        // 移动到新容器
+        playerView.removeFromSuperview()
+        view.addSubview(playerView)
         
-        // 添加到新容器
-        view.layer.addSublayer(layer)
-        
-        // 更新 frame 和 gravity（使用 CATransaction 避免动画）
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer.frame = view.bounds
-        layer.videoGravity = avGravity(from: videoGravity)
-        CATransaction.commit()
-        
-        // 确保 layer 可见
-        layer.isHidden = false
-        
-        // 确保 layer 在最上层（避免被其他视图遮挡）
-        if let sublayers = view.layer.sublayers {
-            view.layer.insertSublayer(layer, at: UInt32(sublayers.count))
+        // 重置约束
+        playerView.snp.remakeConstraints { make in
+            make.edges.equalToSuperview()
         }
+        playerView.videoGravity = avGravity(from: videoGravity)
         
-//        print("Player container updated, new frame: \(view.bounds), gravity: \(videoGravity)")
+        // 确保可见
+        playerView.isHidden = false
+        
+        // 确保在最下层（背景）或根据需要调整层级
+        view.sendSubviewToBack(playerView)
+        
         containerView = view
         if previousContainer !== view {
             delegate?.player(self, didChangeContainerFrom: previousContainer, to: view)
@@ -297,11 +327,13 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
 
     public func updatePlayerFrame(_ frame: CGRect) {
         assertMainThread()
-        guard let layer = playerLayer else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer.frame = frame
-        CATransaction.commit()
+        // 使用 PlayerView + SnapKit 后，通常不再手动设置 frame
+        // 如果确实需要更新 frame，建议更新约束
+        // 这里为了兼容接口，如果 playerView 没有使用约束（autoresizing），可以直接设置 frame
+        // 但我们在 play 中使用了 SnapKit，所以这里应该更新约束
+        // 暂时假设外部不再调用此方法，或者此方法意图是更新约束的 offset/size
+        // 鉴于 SnapKit edges.equalToSuperview 的特性，此方法可能已废弃
+        playerView.frame = frame
     }
     
     // MARK: - Private Methods
@@ -331,13 +363,20 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 统一清理播放器资源和观察者的内部方法
     /// - Parameter resetState: 是否重置状态为 idle 并触发回调
     private func cleanupPlayerResources(resetState: Bool) {
-        removeObservers()
+        // 先移除所有监听
+        removePlayerObservers()
+        // playerItem = nil 会触发 didSet 移除 Item 的监听
+        playerItem = nil
+        
+        playerLooper?.disableLooping()
+        playerLooper = nil
+        
         player?.pause()
         player?.replaceCurrentItem(with: nil)
-        playerLayer?.removeFromSuperlayer()
+        playerView.removeFromSuperview()
+        playerView.player = nil
         player = nil
-        playerItem = nil
-        playerLayer = nil
+        
         containerView = nil
         currentURL = nil
         originalURLForRetry = nil
@@ -370,20 +409,37 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     
     /// 根据当前 videoGravity 更新 playerLayer 的填充模式和 frame
     private func updatePlayerLayerGravity() {
-        guard let layer = playerLayer else { return }
-        layer.videoGravity = avGravity(from: videoGravity)
-        // 确保在更新 gravity 后，frame 也是正确的
-        if let superlayer = layer.superlayer {
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            layer.frame = superlayer.bounds
-            CATransaction.commit()
+        playerView.videoGravity = avGravity(from: videoGravity)
+    }
+    
+    /// 为 Player 添加监听（currentItem, timeControlStatus, periodicTime）
+    private func addPlayerObservers() {
+        guard let player = player else { return }
+        
+        // 1. 监听 currentItem 变化 (处理 Looper 切换 Item)
+        currentItemObserver = player.observe(\.currentItem, options: [.new]) { [weak self] player, _ in
+            guard let self = self else { return }
+            // 更新 playerItem 属性，这会触发 didSet 并自动重新绑定 Item 级别的 Observer
+            self.playerItem = player.currentItem
+        }
+        
+        // 2. 监听 timeControlStatus (播放/暂停/卡顿) - iOS 10+
+        if #available(iOS 10.0, *) {
+            timeControlStatusObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+                self?.handleTimeControlStatus(player.timeControlStatus)
+            }
+        }
+        
+        // 3. 监听播放进度 (每0.1秒回调一次)
+        let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            self?.handleTimeUpdate(time)
         }
     }
     
-    /// 为当前 player / item 添加 KVO、进度和结束通知监听
-    private func addObservers() {
-        guard let player = player, let item = playerItem else { return }
+    /// 为具体的 PlayerItem 添加监听 (status, loadedTimeRanges, DidPlayToEndTime)
+    private func addPlayerItemObservers(for item: AVPlayerItem?) {
+        guard let item = item else { return }
         
         // 1. 监听 status (准备状态)
         statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -395,40 +451,35 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
             self?.handleBufferUpdate(item)
         }
         
-        // 3. 监听 timeControlStatus (播放/暂停/卡顿) - iOS 10+
-        if #available(iOS 10.0, *) {
-            timeControlStatusObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
-                self?.handleTimeControlStatus(player.timeControlStatus)
-            }
-        }
-        
-        // 4. 监听播放进度 (每0.1秒回调一次)
-        let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
-        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
-            self?.handleTimeUpdate(time)
-        }
-        
-        // 5. 监听播放结束通知
-        NotificationCenter.default.addObserver(self, selector: #selector(playerDidFinishPlaying), name: .AVPlayerItemDidPlayToEndTime, object: item)
+        // 3. 监听播放结束通知
+        NotificationCenter.default.addObserver(self, selector: #selector(playerDidFinishPlaying(_:)), name: .AVPlayerItemDidPlayToEndTime, object: item)
     }
     
-    /// 移除所有已添加的观察者与通知监听
-    private func removeObservers() {
+    /// 移除 Player 级别的监听
+    private func removePlayerObservers() {
         if let timeObserver = timeObserver {
             player?.removeTimeObserver(timeObserver)
             self.timeObserver = nil
         }
         
+        currentItemObserver?.invalidate()
+        currentItemObserver = nil
+        
+        timeControlStatusObserver?.invalidate()
+        timeControlStatusObserver = nil
+    }
+    
+    /// 移除 PlayerItem 级别的监听
+    private func removePlayerItemObservers(for item: AVPlayerItem?) {
         statusObserver?.invalidate()
         statusObserver = nil
         
         bufferObserver?.invalidate()
         bufferObserver = nil
         
-        timeControlStatusObserver?.invalidate()
-        timeControlStatusObserver = nil
-        
-        NotificationCenter.default.removeObserver(self)
+        if let item = item {
+            NotificationCenter.default.removeObserver(self, name: .AVPlayerItemDidPlayToEndTime, object: item)
+        }
     }
     
     // MARK: - Event Handlers
@@ -446,12 +497,12 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
                     guard let self = self else { return }
                     self.player?.play()
                     self.player?.rate = self.playbackRate
-                    self.playerLayer?.isHidden = false
+                    self.playerView.isHidden = false
                 }
             } else {
                 player?.play()
                 player?.rate = playbackRate
-                playerLayer?.isHidden = false
+                playerView.isHidden = false
             }
             
             // 获取视频尺寸 - 异步加载 tracks 防止阻塞主线程
@@ -563,19 +614,25 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     }
     
     /// 播放完成回调（由通知触发）
-    /// 负责更新状态、回调 delegate，并在 isLooping 开启时自动循环播放
-    @objc private func playerDidFinishPlaying() {
-        updateState(.finished)
-        DispatchQueue.main.async {
-            self.delegate?.playerDidFinishPlaying(self)
-        }
+    /// 负责更新状态、回调 delegate
+    @objc private func playerDidFinishPlaying(_ notification: Notification) {
+        // 如果使用了 Looper，它会自动循环，不需要手动 Seek
+        // 但我们仍然需要处理逻辑：比如在循环模式下不一定非要发送 finished 状态，或者只通知一次
+        // 这里我们简单处理：如果是 Loop 模式，Looper 会自动重播，我们仅通知播放完成，不改变 state 为 finished (避免 UI 显示重播按钮)
+        // 除非 isLooping 为 false
         
-        // 循环播放逻辑
         if isLooping {
-            seek(to: 0) { [weak self] finished in
-                if finished {
-                    self?.player?.play()
-                }
+             // Looper 模式下，单次播放结束
+             // 可以在这里做播放次数统计等
+             // 注意：AVPlayerLooper 可能会预加载下一个 Item，导致通知时机可能略有不同，但通常是准确的
+             DispatchQueue.main.async {
+                 self.delegate?.playerDidFinishPlaying(self)
+             }
+        } else {
+            // 非 Looper 模式，正常结束
+            updateState(.finished)
+            DispatchQueue.main.async {
+                self.delegate?.playerDidFinishPlaying(self)
             }
         }
     }
