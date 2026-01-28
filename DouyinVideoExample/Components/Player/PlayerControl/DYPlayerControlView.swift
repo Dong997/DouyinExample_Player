@@ -33,6 +33,7 @@ public class DYPlayerControlView: UIView {
     private var totalDuration: Double = 0
     /// 延迟隐藏错误覆盖层的任务，用于避免频繁闪烁
     private var errorOverlayPendingWorkItem: DispatchWorkItem?
+    private var errorOverlayShowWorkItem: DispatchWorkItem?
     private var pauseIconPendingWorkItem: DispatchWorkItem?
     /// 长按加速播放时展示的提示视图
     private lazy var speedTipView: ShortPlayerSpeedTipView = {
@@ -318,14 +319,16 @@ public class DYPlayerControlView: UIView {
         if new.playerState != old.playerState {
             errorOverlayPendingWorkItem?.cancel()
             errorOverlayPendingWorkItem = nil
+            errorOverlayShowWorkItem?.cancel()
+            errorOverlayShowWorkItem = nil
             pauseIconPendingWorkItem?.cancel()
             pauseIconPendingWorkItem = nil
             
             switch new.playerState {
             case .error:
                 centerPlayIcon.isHidden = true
-                errorOverlayView.isHidden = false
                 fullscreenButton.isHidden = true
+                scheduleShowErrorOverlay()
             case .playing:
                 scheduleHideErrorOverlay()
                 UIView.animate(withDuration: 0.2) {
@@ -337,18 +340,15 @@ public class DYPlayerControlView: UIView {
             case .idle, .preparing, .finished, .buffering:
                 scheduleHideErrorOverlay()
                 centerPlayIcon.isHidden = true
+                self.centerPlayIcon.alpha = 0
             case .paused:
                 scheduleHideErrorOverlay()
-                let workItem = DispatchWorkItem { [weak self] in
-                    guard let self = self else { return }
-                    self.centerPlayIcon.alpha = 0
-                    self.centerPlayIcon.isHidden = false
-                    UIView.animate(withDuration: 0.2) {
-                        self.centerPlayIcon.alpha = 1
-                    }
+                // 恢复简洁逻辑：暂停时直接显示图标（延迟/闪烁问题已由 HomeVC 层面解决）
+                self.centerPlayIcon.alpha = 0
+                self.centerPlayIcon.isHidden = false
+                UIView.animate(withDuration: 0.2) {
+                    self.centerPlayIcon.alpha = 1
                 }
-                pauseIconPendingWorkItem = workItem
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: workItem)
             }
         }
         
@@ -363,12 +363,22 @@ public class DYPlayerControlView: UIView {
     
     /// 延迟隐藏错误覆盖层，防止频繁闪烁
     private func scheduleHideErrorOverlay() {
+        errorOverlayShowWorkItem?.cancel()
         errorOverlayPendingWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             self?.errorOverlayView.isHidden = true
         }
         errorOverlayPendingWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: workItem)
+    }
+    
+    private func scheduleShowErrorOverlay() {
+        errorOverlayShowWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.errorOverlayView.isHidden = false
+        }
+        errorOverlayShowWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: workItem)
     }
     
     /// 更新拖拽时显示的浮动时间文案

@@ -215,6 +215,11 @@ public class VideoCacheManager: NSObject {
     /// - Parameter url: 视频 URL
     /// - Parameter length: 预加载长度 (默认 2MB)
     public func preload(url: URL, length: Int = 2 * 1024 * 1024) {
+        if isURLInBlacklist(url) {
+            print("[VideoCacheManager] URL is in blacklist, skip preloading: \(url.lastPathComponent)")
+            return
+        }
+        
         guard KTVHTTPCache.proxyIsRunning() else { return }
         
         let urlString = url.absoluteString

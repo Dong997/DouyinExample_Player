@@ -126,8 +126,95 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     
     // MARK: - Public Methods
     
+    /// 预加载视频资源但不自动播放
+    /// - Parameters:
+    ///   - url: 视频 URL
+    ///   - originalURL: 原始 URL
+    public func prepare(url: URL, originalURL: URL? = nil) {
+        assertMainThread()
+        // 如果已经在播放同一个 URL，则忽略
+        if currentURL == url { return }
+        
+        // 清理旧资源但不重置 UI（因为可能还未 attach 到 view）
+        cleanupPlayerResources(resetState: true)
+        
+        self.currentURL = url
+        self.originalURL = originalURL
+        self.updateState(.preparing)
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            let asset = AVURLAsset(url: url)
+            let keys = ["playable"]
+            asset.loadValuesAsynchronously(forKeys: keys) { [weak self] in
+                guard let self = self else { return }
+                var error: NSError?
+                let status = asset.statusOfValue(forKey: "playable", error: &error)
+                if status == .loaded && asset.isPlayable {
+                    let initialItem = AVPlayerItem(asset: asset)
+                    DispatchQueue.main.async {
+                        if self.isLooping {
+                            let queuePlayer = AVQueuePlayer(playerItem: initialItem)
+                            self.playerLooper = AVPlayerLooper(player: queuePlayer, templateItem: initialItem)
+                            self.player = queuePlayer
+                        } else {
+                            self.player = AVPlayer(playerItem: initialItem)
+                        }
+                        self.playerItem = initialItem
+                        guard let player = self.player else { return }
+                        player.isMuted = self.isMuted
+                        player.volume = self.volume
+                        if #available(iOS 10.0, *) {
+                            player.automaticallyWaitsToMinimizeStalling = false
+                        }
+                        // 预加载模式下暂不暂停，保持 pause 状态等待指令
+                        player.pause()
+                        
+                        // 绑定 Player 到 View，但 View 可能还未显示
+                        self.playerView.player = player
+                        self.addPlayerObservers()
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        let message = error?.localizedDescription ?? "Asset not playable"
+                        self.updateState(.error(message))
+                        self.delegate?.player(self, didFailWithError: error)
+                    }
+                }
+            }
+        }
+    }
+    
+    /// 重置播放器状态以便复用
+    public func reset() {
+        assertMainThread()
+        cleanupPlayerResources(resetState: true)
+        containerView = nil
+        delegate = nil
+        playerView.isHidden = true
+    }
+
     public func play(url: URL, originalURL: URL? = nil, in view: UIView, seekTo: TimeInterval? = nil) {
         assertMainThread()
+        
+        // 检查是否是同一个视频，且播放器可用
+        if currentURL == url, player != nil {
+            // 只是切换容器或恢复播放
+            updateContainer(view)
+            
+            // 如果有 seek 需求
+            if let time = seekTo {
+                seek(to: time) { [weak self] _ in
+                    self?.resume()
+                }
+            } else {
+                resume()
+            }
+            
+            // 确保显示
+            playerView.isHidden = false
+            return
+        }
+        
         let previousContainer = containerView
         stop()
         self.currentURL = url
@@ -137,11 +224,13 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         DispatchQueue.main.async {
             view.layoutIfNeeded()
             self.playerView.removeFromSuperview()
+            self.playerView.player = nil
+            self.playerView.playerLayer.contents = nil
             view.addSubview(self.playerView)
             self.playerView.snp.remakeConstraints { make in
                 make.edges.equalToSuperview()
             }
-            self.playerView.isHidden = true
+            self.playerView.isHidden = false
             self.updateState(.preparing)
             self.containerView = view
             if previousContainer !== view {
@@ -474,19 +563,38 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         switch status {
         case .readyToPlay:
             // 准备好播放了
-            if let seekTime = pendingSeekTime {
-                let target = seekTime
-                pendingSeekTime = nil
-                seek(to: target) { [weak self] _ in
-                    guard let self = self else { return }
-                    self.player?.play()
-                    self.player?.rate = self.playbackRate
-                    self.playerView.isHidden = false
+            
+            // 只有当不是在“仅预加载”模式（即 containerView != nil 或明确要求播放）时，才触发自动播放逻辑
+            // 如果是 prepare() 触发的 readyToPlay，且此时还没有 attach 到 view，我们只做状态标记，不调 play()
+            
+            // 无论如何，先确保 playerLayer 已经关联了 player（在 prepare 中已做，这里再次确认无害）
+            
+            if containerView != nil {
+                if let seekTime = pendingSeekTime {
+                    let target = seekTime
+                    pendingSeekTime = nil
+                    seek(to: target) { [weak self] _ in
+                        guard let self = self else { return }
+                        self.player?.play()
+                        self.player?.rate = self.playbackRate
+                        self.playerView.isHidden = false
+                    }
+                } else {
+                    // 如果处于暂停状态且不是预加载（有 container），则恢复播放
+                    if state != .paused {
+                         player?.play()
+                         player?.rate = playbackRate
+                    }
+                    playerView.isHidden = false
                 }
             } else {
-                player?.play()
-                player?.rate = playbackRate
-                playerView.isHidden = false
+                 // 预加载完成，保持暂停，但在 play() 被调用并 attach view 后能立即显示
+                 // 可以考虑在这里预先解码第一帧（seek to 0）
+                 // 抖音优化技巧：预先 seek 到 0 并 render 一帧
+                 if let player = player, player.currentItem?.currentTime() == .zero {
+                     // 这一步对于首帧秒开很重要，强制渲染管线准备好数据
+                     player.preroll(atRate: 1.0) { _ in }
+                 }
             }
             
             // 获取视频尺寸 - 异步加载 tracks 防止阻塞主线程

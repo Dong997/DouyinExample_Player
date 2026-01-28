@@ -20,13 +20,18 @@ public class VideoPreloadManager {
     /// 单个视频预加载大小（字节），默认 2MB
     public var preloadSize: Int = 2 * 1024 * 1024
     
+    public var maxConcurrentPreloads: Int = 3
+    
     private let minPreloadSize = 1 * 1024 * 1024 // 1MB
     private let maxPreloadSize = 5 * 1024 * 1024 // 5MB
     private var requestsSinceLastAdjustment = 0
     private let adjustmentThreshold = 5 // 每 5 次请求尝试调整一次
     
-    /// 当前正在预加载的 URL 集合 (用于避免重复操作)
     private var preloadingUrls: Set<URL> = []
+
+    private var runningPreloads: Set<URL> = []
+
+    private var currentAllURLs: [URL] = []
     
     /// 发起预加载请求的总次数（不含命中缓存的情况）
     public private(set) var totalPreloadRequests: Int = 0
@@ -62,7 +67,8 @@ public class VideoPreloadManager {
         return Double(totalPreloadFailed) / Double(totalPreloadRequests)
     }
     
-    /// 用于监听 VideoCacheManager 发出的预加载通知
+    private let stateQueue = DispatchQueue(label: "com.douyin.videoPreloadManager.state")
+    
     private let notificationCenter: NotificationCenter
     
     /// 私有化构造函数，确保通过 shared 访问
@@ -81,71 +87,90 @@ public class VideoPreloadManager {
     ///   - currentURL: 当前正在播放的视频 URL (可选)
     ///   - allURLs: 当前列表的所有视频 URL 数组
     public func updateStrategy(currentURL: URL?, allURLs: [URL]) {
-        guard !allURLs.isEmpty else {
-            cancelAll()
-            return
-        }
-        
-        // 1. 确定当前播放的索引
-        let currentIndex: Int
-        if let currentURL = currentURL, let index = allURLs.firstIndex(of: currentURL) {
-            currentIndex = index
-        } else {
-            currentIndex = -1
-        }
-        
-        // 2. 计算需要预加载的 URL 集合
-        var targetPreloadURLs: Set<URL> = []
-        
-        if currentIndex >= 0 {
-            // 向前预加载
-            let startPrev = max(0, currentIndex - preloadPreviousCount)
-            let endPrev = currentIndex
-            if startPrev < endPrev {
-                targetPreloadURLs.formUnion(allURLs[startPrev..<endPrev])
+        stateQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.currentAllURLs = allURLs
+            
+            guard !allURLs.isEmpty else {
+                self.cancelAllOnQueue()
+                return
             }
             
-            // 向后预加载
-            let startNext = currentIndex + 1
-            let endNext = min(startNext + preloadNextCount, allURLs.count)
-            if startNext < endNext {
-                targetPreloadURLs.formUnion(allURLs[startNext..<endNext])
-            }
-        } else if currentURL == nil {
-            // 如果没有当前播放的 URL (例如刚进入页面)，预加载前几个
-            let count = min(preloadNextCount, allURLs.count)
-            targetPreloadURLs.formUnion(allURLs[0..<count])
-        }
-        
-        // 3. 执行差异化更新
-        
-        // 需要取消的：在正在预加载集合中，但不在目标集合中的
-        let urlsToCancel = preloadingUrls.subtracting(targetPreloadURLs)
-        for url in urlsToCancel {
-            VideoCacheManager.shared.cancelPreload(for: url)
-        }
-        
-        // 需要开始的：在目标集合中，但不在正在预加载集合中的
-        // 注意：VideoCacheManager 内部也会判重，但这里维护一个 Set 可以减少跨模块调用
-        let urlsToStart = targetPreloadURLs.subtracting(preloadingUrls)
-        for url in urlsToStart {
-            // 如果已经完全缓存了，就不需要预加载了 (VideoCacheManager 可能不暴露这个状态，最好检查一下)
-            if VideoCacheManager.shared.isFullyCached(for: url) {
-                totalPreloadHits += 1
+            let currentIndex: Int
+            if let currentURL = currentURL, let index = allURLs.firstIndex(of: currentURL) {
+                currentIndex = index
             } else {
-                totalPreloadRequests += 1
-                VideoCacheManager.shared.preload(url: url, length: preloadSize)
+                currentIndex = -1
             }
+            
+            var targetPreloadURLs: Set<URL> = []
+            
+            if currentIndex >= 0 {
+                let startPrev = max(0, currentIndex - self.preloadPreviousCount)
+                let endPrev = currentIndex
+                if startPrev < endPrev {
+                    targetPreloadURLs.formUnion(allURLs[startPrev..<endPrev])
+                }
+                
+                let startNext = currentIndex + 1
+                let endNext = min(startNext + self.preloadNextCount, allURLs.count)
+                if startNext < endNext {
+                    targetPreloadURLs.formUnion(allURLs[startNext..<endNext])
+                }
+            } else if currentURL == nil {
+                let count = min(self.preloadNextCount, allURLs.count)
+                targetPreloadURLs.formUnion(allURLs[0..<count])
+            }
+            
+            let newInWindow = targetPreloadURLs.subtracting(self.preloadingUrls)
+            for url in newInWindow {
+                if VideoCacheManager.shared.isFullyCached(for: url) {
+                    self.totalPreloadHits += 1
+                }
+            }
+            
+            self.preloadingUrls = targetPreloadURLs
+            self.schedulePreloads()
+        }
+    }
+    
+    /// 调度预加载任务：取消越界的，启动窗口内的，遵守并发限制
+    private func schedulePreloads() {
+        let toCancel = runningPreloads.subtracting(preloadingUrls)
+        for url in toCancel {
+            VideoCacheManager.shared.cancelPreload(for: url)
+            runningPreloads.remove(url)
+        }
+
+        let candidates = currentAllURLs.filter { url in
+            preloadingUrls.contains(url) &&
+            !runningPreloads.contains(url) &&
+            !VideoCacheManager.shared.isFullyCached(for: url)
         }
         
-        // 更新当前状态
-        preloadingUrls = targetPreloadURLs
+        for url in candidates {
+            if runningPreloads.count >= maxConcurrentPreloads {
+                break
+            }
+            
+            VideoCacheManager.shared.preload(url: url, length: preloadSize)
+            totalPreloadRequests += 1
+            runningPreloads.insert(url)
+        }
     }
     
     /// 取消所有预加载任务
     public func cancelAll() {
+        stateQueue.async { [weak self] in
+            self?.cancelAllOnQueue()
+        }
+    }
+    
+    private func cancelAllOnQueue() {
         VideoCacheManager.shared.cancelAllPreloads()
         preloadingUrls.removeAll()
+        runningPreloads.removeAll()
+        currentAllURLs.removeAll()
     }
     
     /// 清理所有磁盘缓存
@@ -160,14 +185,28 @@ public class VideoPreloadManager {
     
     /// 处理预加载完成通知，累加成功计数
     @objc private func handlePreloadFinished(_ notification: Notification) {
-        totalPreloadCompleted += 1
-        checkAndAdjustPreloadSize()
+        stateQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.totalPreloadCompleted += 1
+            if let userInfo = notification.userInfo, let url = userInfo["url"] as? URL {
+                self.runningPreloads.remove(url)
+            }
+            self.schedulePreloads()
+            self.checkAndAdjustPreloadSize()
+        }
     }
     
     /// 处理预加载失败通知，累加失败计数
     @objc private func handlePreloadFailed(_ notification: Notification) {
-        totalPreloadFailed += 1
-        checkAndAdjustPreloadSize()
+        stateQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.totalPreloadFailed += 1
+            if let userInfo = notification.userInfo, let url = userInfo["url"] as? URL {
+                self.runningPreloads.remove(url)
+            }
+            self.schedulePreloads()
+            self.checkAndAdjustPreloadSize()
+        }
     }
     
     /// 根据成功/失败率动态调整预加载大小

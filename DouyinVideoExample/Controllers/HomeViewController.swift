@@ -10,6 +10,7 @@ class HomeViewController: UIViewController {
     private let retryHandler = PlaybackRetryHandler()
     private var cancellables = Set<AnyCancellable>()
     private var currentPlayingIndexPath: IndexPath?
+    private var playerMap: [Int: DYVideoPlayer] = [:] // 管理预加载的播放器实例
     private var isDraggingProgress = false
     private var fullscreenTransitioningDelegate: FullscreenVideoTransitioningDelegate?
     private let bottomBar: UIView = {
@@ -202,20 +203,60 @@ class HomeViewController: UIViewController {
     }
     
     private func playVideo(at indexPath: IndexPath) {
-        // 如果切换了视频，先保存上一个视频的播放进度
+        let index = indexPath.item
+        guard viewModel.videos.indices.contains(index) else { return }
+        
+        // 1. 如果切换了视频，先处理上一个视频
         if let current = currentPlayingIndexPath, current != indexPath {
             let time = DYPlayerManager.shared.player.currentTime
             viewModel.updateResumeTime(for: current.item, time: time)
+            // 暂停旧播放器
+            DYPlayerManager.shared.player.pause()
         }
         
-        guard let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
-        let video = viewModel.videos[indexPath.item]
-        
         currentPlayingIndexPath = indexPath
+        guard let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
+        let video = viewModel.videos[index]
+        
+        // 2. 获取或创建播放器
+        let player: DYVideoPlayer
+        if let existing = playerMap[index] {
+            player = existing
+            print("⚡️ Hit preload player for index: \(index)")
+        } else {
+            player = DYPlayerManager.shared.acquirePreloadPlayer()
+            playerMap[index] = player
+            print("🐢 Acquire new player for index: \(index)")
+        }
+        
+        // 3. 提升为 Current Player 并绑定
+        DYPlayerManager.shared.promoteToCurrent(player)
+        player.delegate = self
+        
+        let isSameVideo: Bool
+        if let originalURL = player.originalURL {
+            isSameVideo = (originalURL == video.videoURL)
+        } else if let currentURL = player.currentURL {
+            isSameVideo = (currentURL == video.videoURL)
+        } else {
+            isSameVideo = false
+        }
+        if isSameVideo, player.containerView !== cell.playerContainerView {
+            player.updateContainer(cell.playerContainerView)
+        }
         
         cell.controlView.delegate = self
-        cell.controlView.updateProgress(currentTime: 0, totalTime: 0)
-        cell.controlView.updateCenterBtnState(.preparing)
+        // 立即更新 UI 状态
+        // 优化：切换视频时，即使播放器处于 Paused（预加载完成状态），UI 上也应视为准备播放（隐藏暂停按钮）
+        // 避免出现“先显示暂停图标，然后立即消失”的闪烁
+        if player.state == .paused {
+            cell.controlView.updateCenterBtnState(.preparing)
+        }else if player.state == .idle{
+            cell.controlView.updateCenterBtnState(.preparing)
+        } else {
+            cell.controlView.updateCenterBtnState(player.state)
+        }
+        cell.controlView.updateProgress(currentTime: player.currentTime, totalTime: player.duration)
         
         // 点击标题跳转详情页
         cell.onTitleTapped = { [weak self] in
@@ -225,16 +266,67 @@ class HomeViewController: UIViewController {
             self.navigationController?.pushViewController(detailVC, animated: true)
         }
         
-        // 使用缓存代理播放，如果代理失败会自动降级为原始 URL
+        // 4. 播放 (如果已预加载，playWithCache 内部会直接 resume)
+        // 注意：playWithCache 内部默认使用 shared.player，现在我们已经 promote 过了，所以没问题。
+        // 但为了保险，我们可以扩展 playWithCache 接受 player 参数，或者依靠 promoteToCurrent 的副作用。
+        // 我们刚刚修改了 playWithCache 支持 use 参数，这里显式传入更清晰。
         if video.resumeTime > 0 {
-            DYPlayerManager.shared.playWithCache(originalURL: video.videoURL, in: cell.playerContainerView, seekTo: video.resumeTime)
+            DYPlayerManager.shared.playWithCache(originalURL: video.videoURL, in: cell.playerContainerView, seekTo: video.resumeTime, use: player)
         } else {
-            DYPlayerManager.shared.playWithCache(originalURL: video.videoURL, in: cell.playerContainerView)
+            DYPlayerManager.shared.playWithCache(originalURL: video.videoURL, in: cell.playerContainerView, use: player)
         }
         
-        // 更新预加载策略 (前后各预加载1个)
+        // 5. 更新预加载策略 (数据层)
         let allURLs = viewModel.videos.map { $0.videoURL }
         VideoPreloadManager.shared.updateStrategy(currentURL: video.videoURL, allURLs: allURLs)
+        
+        // 6. 触发下一个视频的播放器预加载
+        managePreloadPlayers(currentIndex: index)
+    }
+    
+    private func managePreloadPlayers(currentIndex: Int) {
+        // 新策略：保留上一个、当前、下一个
+        var keepIndices = Set([currentIndex])
+        if currentIndex + 1 < viewModel.videos.count {
+            keepIndices.insert(currentIndex + 1)
+        }
+        if currentIndex - 1 >= 0 {
+            keepIndices.insert(currentIndex - 1)
+        }
+        
+        // 清理不再需要的播放器
+        let keysToRemove = playerMap.keys.filter { !keepIndices.contains($0) }
+        for key in keysToRemove {
+            if let p = playerMap.removeValue(forKey: key) {
+                if p !== DYPlayerManager.shared.player {
+                    p.stop()
+                    p.reset()
+                }
+            }
+        }
+        
+        // 预加载下一个
+        let nextIndex = currentIndex + 1
+        preloadVideo(at: nextIndex)
+        
+        // 预加载上一个
+        let prevIndex = currentIndex - 1
+        preloadVideo(at: prevIndex)
+    }
+    
+    private func preloadVideo(at index: Int) {
+        guard viewModel.videos.indices.contains(index) else { return }
+        if playerMap[index] != nil { return } // 已在预加载
+        
+        let player = DYPlayerManager.shared.acquirePreloadPlayer()
+        playerMap[index] = player
+        
+        let video = viewModel.videos[index]
+        print("🚀 Preloading player for index: \(index)")
+        // 绑定 delegate 也可以监听预加载状态，但要小心不要干扰当前 UI
+        // 这里暂不绑定 delegate，因为 DYVideoPlayer 的 prepare 已经足够
+        // 如果需要监听错误，可以绑定，但在回调里要 filter
+        DYPlayerManager.shared.preload(originalURL: video.videoURL, use: player)
     }
 
     private func presentFullscreen(for indexPath: IndexPath) {
@@ -301,6 +393,30 @@ extension HomeViewController: UICollectionViewDelegate, UICollectionViewDataSour
         return cell
     }
     
+    func collectionView(_ collectionView: UICollectionView, willDisplay cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
+        guard let videoCell = cell as? VideoCell else { return }
+        let index = indexPath.item
+        if let player = playerMap[index] {
+            let video = viewModel.videos[index]
+            let isSameVideo: Bool
+            if let originalURL = player.originalURL {
+                isSameVideo = (originalURL == video.videoURL)
+            } else if let currentURL = player.currentURL {
+                isSameVideo = (currentURL == video.videoURL)
+            } else {
+                isSameVideo = false
+            }
+            if isSameVideo, player.containerView !== videoCell.playerContainerView {
+                player.updateContainer(videoCell.playerContainerView)
+            }
+            if player.state == .paused || player.state == .idle {
+                videoCell.controlView.updateCenterBtnState(.preparing)
+            }
+        } else {
+            preloadVideo(at: index)
+        }
+    }
+
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         // Tap to pause/resume
         let player = DYPlayerManager.shared.player
@@ -329,9 +445,9 @@ extension HomeViewController: UICollectionViewDelegate, UICollectionViewDataSour
     func collectionView(_ collectionView: UICollectionView, didEndDisplaying cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
         if currentPlayingIndexPath == indexPath {
             let current = DYPlayerManager.shared.player.currentTime
-            // 必须在 stop() 之前保存进度，因为 stop() 会重置播放器导致时间丢失
             viewModel.updateResumeTime(for: indexPath.item, time: current)
-            DYPlayerManager.shared.stop()
+            // 仅暂停，不完全销毁，等待可能的复用或由 managePreloadPlayers 清理
+            DYPlayerManager.shared.player.pause()
             currentPlayingIndexPath = nil
         }
     }
@@ -340,12 +456,17 @@ extension HomeViewController: UICollectionViewDelegate, UICollectionViewDataSour
 // MARK: - DYVideoPlayerDelegate
 extension HomeViewController: DYVideoPlayerDelegate {
     func player(_ player: DYVideoPlayer, didChangeState state: DYPlayerState) {
+        // 仅响应当前播放器的状态回调，忽略预加载播放器的回调
+        if player != DYPlayerManager.shared.player { return }
+        
         guard let indexPath = currentPlayingIndexPath,
               let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
         cell.controlView.updateCenterBtnState(state)
     }
     
     func player(_ player: DYVideoPlayer, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double) {
+        if player != DYPlayerManager.shared.player { return }
+        
         guard let indexPath = currentPlayingIndexPath,
               let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
         
@@ -353,6 +474,8 @@ extension HomeViewController: DYVideoPlayerDelegate {
     }
     
     func player(_ player: DYVideoPlayer, didFailWithError error: Error?) {
+        if player != DYPlayerManager.shared.player { return }
+        
         guard let indexPath = currentPlayingIndexPath else { return }
         let video = viewModel.videos[indexPath.item]
         
@@ -361,10 +484,7 @@ extension HomeViewController: DYVideoPlayerDelegate {
            let retryURL = retryHandler.shouldRetry(for: error, currentURL: currentURL, originalURL: video.videoURL) {
             
             print("[HomeViewController] Retrying with URL: \(retryURL)")
-            // 重新播放（playVideo 内部会再次调用 DYPlayerManager，但由于已加入黑名单，这次会拿到原始 URL）
-            // 或者更直接地：
-            // DYPlayerManager.shared.play(url: retryURL, in: cell.playerContainerView)
-            // 但为了保持逻辑一致性（如 updateResumeTime 等），调用 playVideo 比较稳妥
+            // 重新播放
             playVideo(at: indexPath)
             
         } else {

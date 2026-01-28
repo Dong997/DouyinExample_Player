@@ -247,7 +247,12 @@ class FullscreenVideoViewController: UIViewController {
     
     /// 在播放器容器中开始播放当前视频
     private func playVideo() {
-        DYPlayerManager.shared.playWithCache(originalURL: videoURL, in: playerContainerView, seekTo: currentTime)
+        if let dyPlayer = player as? DYVideoPlayer {
+            DYPlayerManager.shared.playWithCache(originalURL: videoURL, in: playerContainerView, seekTo: currentTime, use: dyPlayer)
+        } else {
+            // Fallback (should not happen in this project)
+            DYPlayerManager.shared.playWithCache(originalURL: videoURL, in: playerContainerView, seekTo: currentTime)
+        }
         player.videoGravity = .aspectFit
     }
     
