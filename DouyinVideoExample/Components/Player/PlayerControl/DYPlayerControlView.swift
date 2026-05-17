@@ -1,7 +1,22 @@
+/// @file DYPlayerControlView.swift
+/// @brief 视频播放器控制视图 — 提供播放/暂停、进度条、加载动画、全屏按钮等交互控件
+/// @author jscn-app
+/// @date 2025-05-13
 import UIKit
 import SnapKit
 
 /// 播放器控制视图 (进度条、暂停按钮、错误覆盖层等)
+///
+/// 使用 Diff 渲染策略：内部维护 ViewState 快照，仅在状态变化时更新 UI，
+/// 避免高频回调（如进度更新）导致的重复渲染开销。
+///
+/// 使用示例：
+/// ```swift
+/// let controlView = DYPlayerControlView()
+/// controlView.delegate = self
+/// controlView.updateCenterBtnState(.playing)
+/// controlView.updateProgress(0.5, currentTime: 30, totalTime: 60)
+/// ```
 public class DYPlayerControlView: UIView {
     
     // MARK: - Properties
@@ -22,7 +37,6 @@ public class DYPlayerControlView: UIView {
     
     /// 控制视图代理，负责接收用户交互事件并转发给外部
     public weak var delegate: DYPlayerControlViewDelegate?
-    
     /// 是否正在拖拽进度条，拖拽中时不会自动更新进度条位置
     private var isDragging: Bool = false
     /// 是否处于长按加速播放状态
@@ -229,6 +243,30 @@ public class DYPlayerControlView: UIView {
         }
     }
 
+    /// 重置控制层到新 cell 的初始状态。
+    /// Diff 渲染只在状态变化时更新 UI，复用前显式清 UI 可避免旧 cell 的按钮残留或初始按钮缺失。
+    public func resetForReuse() {
+        pauseIconPendingWorkItem?.cancel()
+        pauseIconPendingWorkItem = nil
+        errorOverlayPendingWorkItem?.cancel()
+        errorOverlayPendingWorkItem = nil
+        errorOverlayShowWorkItem?.cancel()
+        errorOverlayShowWorkItem = nil
+
+        viewState = ViewState()
+        centerPlayIcon.image = UIImage(systemName: "play.fill")
+        centerPlayIcon.alpha = 1
+        centerPlayIcon.isHidden = true
+        errorOverlayView.isHidden = true
+        speedTipView.hideSpeedView()
+        progressBar.finishLoading()
+        progressBar.updateProgress(to: 0)
+        progressBar.updateBuffer(to: 0)
+        totalDuration = 0
+        isDragging = false
+        isFastPlaying = false
+    }
+
     /// 更新加载状态，控制加载动画与错误覆盖层
     /// - Parameter isLoading: 是否正在加载
     public func updateLoading(isLoading: Bool) {
@@ -330,6 +368,7 @@ public class DYPlayerControlView: UIView {
                 fullscreenButton.isHidden = true
                 scheduleShowErrorOverlay()
             case .playing:
+                centerPlayIcon.image = UIImage(systemName: "pause.fill")
                 scheduleHideErrorOverlay()
                 UIView.animate(withDuration: 0.2) {
                     self.centerPlayIcon.alpha = 0
@@ -343,6 +382,7 @@ public class DYPlayerControlView: UIView {
                 self.centerPlayIcon.alpha = 0
             case .paused:
                 scheduleHideErrorOverlay()
+                centerPlayIcon.image = UIImage(systemName: "play.fill")
                 // 恢复简洁逻辑：暂停时直接显示图标（延迟/闪烁问题已由 HomeVC 层面解决）
                 self.centerPlayIcon.alpha = 0
                 self.centerPlayIcon.isHidden = false
@@ -386,8 +426,8 @@ public class DYPlayerControlView: UIView {
     ///   - currentTime: 当前时间
     ///   - totalTime: 总时长
     private func updateFloatingTime(currentTime: Double, totalTime: Double) {
-        let currentStr = formatTime(seconds: currentTime)
-        let totalStr = formatTime(seconds: totalTime)
+        let currentStr = DYPlayerUtils.formatTime(seconds: currentTime)
+        let totalStr = DYPlayerUtils.formatTime(seconds: totalTime)
         
         // 创建富文本，设置不同颜色
         let fullText = "\(currentStr) / \(totalStr)"
@@ -400,17 +440,6 @@ public class DYPlayerControlView: UIView {
         }
         
         floatingTimeLabel.attributedText = attributedString
-    }
-    
-    /// 将秒数格式化为 `mm:ss` 字符串
-    /// - Parameter seconds: 秒数
-    /// - Returns: 格式化后的时间字符串
-    private func formatTime(seconds: Double) -> String {
-        guard !seconds.isNaN && !seconds.isInfinite else { return "00:00" }
-        let secs = Int(seconds)
-        let minutes = secs / 60
-        let secondsValue = secs % 60
-        return String(format: "%02d:%02d", minutes, secondsValue)
     }
 
     /// 错误覆盖层视图，用于展示“加载错误”等提示

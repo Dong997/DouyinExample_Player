@@ -1,8 +1,9 @@
 import UIKit
 import SnapKit
+import os.log
 
 /// 全屏视频播放控制器，负责承载系统播放器并管理交互控制
-class FullscreenVideoViewController: UIViewController {
+class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable {
 
     // MARK: - Properties
     
@@ -13,7 +14,10 @@ class FullscreenVideoViewController: UIViewController {
     /// 视频宽高比，用于按比例扩展布局
     private let aspectRatio: Double?
     /// 播放器依赖，由外部注入
-    private var player: DYVideoAdvancedControlInput
+    /// 使用 DYVideoPlayerSession 协议，支持容器迁移、URL 比对等全屏场景所需能力
+    private var player: DYVideoPlayerSession
+    /// 缓存播放编排（与列表共用同一实现，保证单一控制流）
+    private let playback: DYPlaybackCoordinating
     /// 全屏时支持的屏幕方向，默认横屏
     private let fullscreenOrientationMask: UIInterfaceOrientationMask
     /// 退出全屏时的回调，用于通知外部恢复状态
@@ -93,7 +97,7 @@ class FullscreenVideoViewController: UIViewController {
 
     /// 控制器释放时的日志，便于排查内存是否正确释放
     deinit {
-        NSLog("FullscreenVideoViewController deinit")
+        AppLog.ui.debug("FullscreenVideoViewController deinit")
     }
 
     // MARK: - Initialization
@@ -109,12 +113,14 @@ class FullscreenVideoViewController: UIViewController {
         currentTime: TimeInterval,
         aspectRatio: Double?,
         fullscreenOrientationMask: UIInterfaceOrientationMask = .landscapeRight,
-        player: DYVideoAdvancedControlInput
+        player: DYVideoPlayerSession,
+        playback: DYPlaybackCoordinating
     ) {
         self.videoURL = videoURL
         self.currentTime = currentTime
         self.aspectRatio = aspectRatio
         self.player = player
+        self.playback = playback
         self.fullscreenOrientationMask = fullscreenOrientationMask
         super.init(nibName: nil, bundle: nil)
         self.modalPresentationStyle = .fullScreen
@@ -147,7 +153,7 @@ class FullscreenVideoViewController: UIViewController {
         view.addGestureRecognizer(singleTapGesture)
         view.addGestureRecognizer(doubleTapGesture)
         centerPlayButton.addTarget(self, action: #selector(handleCenterPlayButtonTapped), for: .touchUpInside)
-        player.delegate = self
+        player.multicastDelegate.add(self)
         currentSpeed = player.playbackRate
         updateSpeedButtonTitle()
         playVideo()
@@ -175,7 +181,7 @@ class FullscreenVideoViewController: UIViewController {
     }
 
     /// 返回全屏播放时支持的屏幕方向
-    override var dyFullscreenOrientationMask: UIInterfaceOrientationMask {
+    var dySupportedOrientations: UIInterfaceOrientationMask {
         return fullscreenOrientationMask
     }
 
@@ -234,7 +240,7 @@ class FullscreenVideoViewController: UIViewController {
         controlsContainerView.addSubview(closeButton)
         closeButton.snp.makeConstraints { make in
             make.leading.equalToSuperview().offset(16)
-            make.top.equalToSuperview().offset(8)
+            make.top.equalToSuperview().offset(100)
             make.width.height.equalTo(32)
         }
         
@@ -247,18 +253,14 @@ class FullscreenVideoViewController: UIViewController {
     
     /// 在播放器容器中开始播放当前视频
     private func playVideo() {
-        if let dyPlayer = player as? DYVideoPlayer {
-            DYPlayerManager.shared.playWithCache(originalURL: videoURL, in: playerContainerView, seekTo: currentTime, use: dyPlayer)
-        } else {
-            // Fallback (should not happen in this project)
-            DYPlayerManager.shared.playWithCache(originalURL: videoURL, in: playerContainerView, seekTo: currentTime)
-        }
+        playback.playWithCache(originalURL: videoURL, in: playerContainerView, seekTo: currentTime, use: nil)
         player.videoGravity = .aspectFit
     }
     
     @objc private func handleClose() {
         dismiss(animated: true) { [weak self] in
             self?.onDismiss?()
+            self?.onDismiss = nil
         }
     }
 }
@@ -327,20 +329,9 @@ extension FullscreenVideoViewController {
     ///   - currentTime: 当前播放时间，单位秒
     ///   - totalTime: 视频总时长，单位秒
     private func updateTimeLabel(currentTime: Double, totalTime: Double) {
-        let currentText = formatTime(seconds: currentTime)
-        let totalText = formatTime(seconds: totalTime)
+        let currentText = DYPlayerUtils.formatTime(seconds: currentTime)
+        let totalText = DYPlayerUtils.formatTime(seconds: totalTime)
         timeLabel.text = "\(currentText)/\(totalText)"
-    }
-    
-    /// 将秒数格式化为 mm:ss 形式的字符串
-    /// - Parameter seconds: 时间秒数
-    /// - Returns: 格式化后的时间字符串
-    private func formatTime(seconds: Double) -> String {
-        guard !seconds.isNaN, !seconds.isInfinite else { return "00:00" }
-        let totalSeconds = Int(seconds)
-        let minutes = totalSeconds / 60
-        let remainingSeconds = totalSeconds % 60
-        return String(format: "%02d:%02d", minutes, remainingSeconds)
     }
     
     /// 处理倍速按钮点击，控制倍速选择器的显示与隐藏

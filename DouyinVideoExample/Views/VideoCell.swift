@@ -1,28 +1,48 @@
+/// @file VideoCell.swift
+/// @brief 视频列表 Cell — 承载播放器画面、封面图、标题、控制视图的 CollectionViewCell
+/// @author jscn-app
+/// @date 2025-05-13
 import UIKit
 import SnapKit
 import Kingfisher
 
+/// 视频列表单元格
+///
+/// 职责：
+/// 1. 提供播放器画面容器（playerContainerView），由外部 PlayerCoordinator 绑定播放器
+/// 2. 展示封面图，视频加载前/滑动时显示，播放器就绪后淡出
+/// 3. 展示视频标题，支持点击标题回调（onTitleTapped）
+/// 4. 内嵌 DYPlayerControlView，提供播放/暂停/进度等交互控件
+///
+/// 使用示例：
+/// ```swift
+/// let cell = collectionView.dequeueReusableCell(withReuseIdentifier: VideoCell.identifier, for: indexPath) as! VideoCell
+/// cell.configure(with: video)
+/// cell.controlView.delegate = self
+/// cell.onTitleTapped = { [weak self] in ... }
+/// ```
 class VideoCell: UICollectionViewCell {
     
     static let identifier = "VideoCell"
     
-    // Container for the video player
+    /// 播放器画面容器，AVPlayerLayer 的宿主视图
     let playerContainerView: UIView = {
         let view = UIView()
-        view.backgroundColor = .clear 
+        view.backgroundColor = .black
         return view
     }()
     
-    // Cover image view
+    /// 封面图：视频加载前/滑动时显示，播放器就绪后淡出
+    /// 层级：playerContainerView 之上、controlView 之下
+    /// 使用 scaleAspectFit 等比例拉伸，不裁剪铺满，保持画面完整
     let coverImageView: UIImageView = {
-        let imageView = UIImageView()
-        imageView.contentMode = .scaleAspectFill
-        imageView.clipsToBounds = true
-        imageView.backgroundColor = .lightGray
-        return imageView
+        let iv = UIImageView()
+        iv.contentMode = .scaleAspectFit
+        iv.clipsToBounds = true
+        iv.backgroundColor = .black
+        return iv
     }()
     
-    // Title label
     let titleLabel: UILabel = {
         let label = UILabel()
         label.textColor = .white
@@ -31,10 +51,8 @@ class VideoCell: UICollectionViewCell {
         return label
     }()
     
-    // Player Control View
     let controlView = DYPlayerControlView()
     
-    // Callback when title is tapped
     var onTitleTapped: (() -> Void)?
     
     override init(frame: CGRect) {
@@ -42,23 +60,23 @@ class VideoCell: UICollectionViewCell {
         setupUI()
         setupActions()
     }
+
     
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
     
     private func setupUI() {
-        // Correct hierarchy: Cover -> Player -> Title
-//        contentView.addSubview(coverImageView)
         contentView.addSubview(playerContainerView)
+        contentView.addSubview(coverImageView)
         contentView.addSubview(controlView)
         contentView.addSubview(titleLabel)
         
-//        coverImageView.snp.makeConstraints { make in
-//            make.edges.equalToSuperview()
-//        }
-        
         playerContainerView.snp.makeConstraints { make in
+            make.edges.equalToSuperview()
+        }
+        
+        coverImageView.snp.makeConstraints { make in
             make.edges.equalToSuperview()
         }
         
@@ -68,7 +86,7 @@ class VideoCell: UICollectionViewCell {
         
         titleLabel.snp.makeConstraints { make in
             make.leading.trailing.equalToSuperview().inset(16)
-            make.bottom.equalToSuperview().offset(-60) // Leave space for bottom tab bar if any, or safe area
+            make.bottom.equalToSuperview().offset(-60)
         }
     }
     
@@ -84,36 +102,58 @@ class VideoCell: UICollectionViewCell {
     
     func configure(with model: VideoModel) {
         titleLabel.text = model.title
+        controlView.resetForReuse()
         
+        if let coverImage = model.coverImage {
+            coverImageView.image = coverImage
+            coverImageView.isHidden = false
+            coverImageView.alpha = 1.0
+        } else if let coverURL = model.coverURL {
+            coverImageView.kf.setImage(
+                with: coverURL,
+                placeholder: nil,
+                options: [.transition(.fade(0.2))]
+            )
+            coverImageView.isHidden = false
+            coverImageView.alpha = 1.0
+        } else {
+            coverImageView.image = nil
+            coverImageView.isHidden = true
+        }
         
-        // 使用 Kingfisher 加载图片
-        // 之前的手动加载方式容易出现线程安全问题和内存访问错误 (EXC_BAD_ACCESS)
-        // Kingfisher 内部处理了线程切换、缓存和生命周期管理，更加安全稳定
-        // if let url = model.coverURL {
-        //     coverImageView.kf.setImage(
-        //         with: url,
-        //         placeholder: nil,
-        //         options: [
-        //             .transition(.fade(0.2)),
-        //             .cacheOriginalImage
-        //         ]
-        //     )
-        // } else {
-        //     coverImageView.image = nil
-        // }
-        
-        // 更新视频宽高比，决定是否显示全屏按钮
-        // 只有横屏视频 (宽高比 > 1) 才显示全屏按钮
         let isHorizontal = (model.aspectRatio ?? 0) > 1.0
         controlView.updateAspectRatio(model.aspectRatio, shouldShowFullscreenButton: isHorizontal)
     }
     
     override func prepareForReuse() {
         super.prepareForReuse()
-        coverImageView.image = nil
         controlView.delegate = nil
         onTitleTapped = nil
-        controlView.updateProgress(currentTime: 0, totalTime: 0)
-        controlView.updateCenterBtnState(.preparing)
+        controlView.resetForReuse()
+        coverImageView.image = nil
+        coverImageView.isHidden = false
+        coverImageView.alpha = 1.0
+    }
+
+    /// 隐藏封面图（播放器画面就绪后调用）
+    /// - Parameter animated: 是否使用淡出动画
+    func hideCoverImage(animated: Bool) {
+        if animated {
+            guard !coverImageView.isHidden, coverImageView.alpha > 0.01 else { return }
+            UIView.animate(withDuration: 0.3, animations: {
+                self.coverImageView.alpha = 0
+            }, completion: { _ in
+                self.coverImageView.isHidden = true
+            })
+        } else {
+            coverImageView.alpha = 0
+            coverImageView.isHidden = true
+        }
+    }
+
+    /// 显示封面图（新视频开始加载时调用）
+    func showCoverImage() {
+        coverImageView.isHidden = false
+        coverImageView.alpha = 1.0
     }
 }

@@ -1,21 +1,33 @@
 import UIKit
 import SnapKit
 
-class DetailViewController: UIViewController {
+/// 视频详情页控制器
+/// 职责仅限于：
+/// 1. UI 布局与构建
+/// 2. 视频播放器容器管理
+/// 3. 通过 Coordinator 处理导航（不直接 push/pop）
+class DetailViewController: UIViewController, DYOrientationConfigurable {
 
     // MARK: - Properties
 
     private let videoURL: URL
     private let seekTime: TimeInterval
+    private let playerSession: DYVideoPlayerSession
+    private let playback: DYPlaybackCoordinating
     private var hasTakenOverPlayer: Bool = false
-    
-    // Container for the video player
+
+    /// 导航协调器，由 DetailCoordinator 注入
+    weak var coordinator: DetailCoordinator?
+
+    // MARK: - UI Components
+
+    /// 视频播放器容器视图
     let videoContainerView: UIView = {
         let view = UIView()
         view.backgroundColor = .black
         return view
     }()
-    
+
     private let backButton: UIButton = {
         let button = UIButton(type: .system)
         button.setImage(UIImage(systemName: "chevron.left"), for: .normal)
@@ -24,7 +36,7 @@ class DetailViewController: UIViewController {
         button.layer.cornerRadius = 20
         return button
     }()
-    
+
     private let infoLabel: UILabel = {
         let label = UILabel()
         label.text = "Detail Page Content"
@@ -32,7 +44,7 @@ class DetailViewController: UIViewController {
         label.textAlignment = .center
         return label
     }()
-    
+
     private let recommendButton: UIButton = {
         let button = UIButton(type: .system)
         button.setTitle("Play Recommended Video", for: .normal)
@@ -44,13 +56,20 @@ class DetailViewController: UIViewController {
 
     // MARK: - Initialization
 
-    init(videoURL: URL, seekTime: TimeInterval = 0) {
+    init(
+        videoURL: URL,
+        seekTime: TimeInterval = 0,
+        player: DYVideoPlayerSession,
+        playback: DYPlaybackCoordinating
+    ) {
         self.videoURL = videoURL
         self.seekTime = seekTime
+        self.playerSession = player
+        self.playback = playback
         super.init(nibName: nil, bundle: nil)
         hidesBottomBarWhenPushed = true
     }
-    
+
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
@@ -63,63 +82,47 @@ class DetailViewController: UIViewController {
         setupUI()
         setupActions()
     }
-    
+
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         takeOverPlayerIfNeeded()
-        
-        let player = DYPlayerManager.shared.player
-        if player.containerView == videoContainerView {
-            player.updatePlayerFrame(videoContainerView.bounds)
-        }
     }
-    
+
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        
-        // 页面出现时（包括从下一级返回），检查并恢复播放器
-        let player = DYPlayerManager.shared.player
+        let player = playerSession
         if player.containerView != videoContainerView {
             hasTakenOverPlayer = false
             takeOverPlayerIfNeeded()
         }
     }
-    
+
     private func takeOverPlayerIfNeeded() {
         if hasTakenOverPlayer {
             return
         }
-        
+
         if videoContainerView.bounds.isEmpty {
             return
         }
-        
-        let player = DYPlayerManager.shared.player
-        let isSameVideo: Bool
-        if let originalURL = player.originalURL {
-            isSameVideo = originalURL == videoURL
-        } else if let currentURL = player.currentURL {
-            isSameVideo = currentURL == videoURL
-        } else {
-            isSameVideo = false
-        }
-        
+
+        let player = playerSession
+        let isSameVideo = player.isPlaying(url: videoURL)
+
         if isSameVideo {
             player.updateContainer(videoContainerView)
             if player.state != .playing {
                 player.resume()
             }
         } else {
-            DYPlayerManager.shared.playWithCache(originalURL: videoURL, in: videoContainerView, seekTo: seekTime)
+            playback.playWithCache(originalURL: videoURL, in: videoContainerView, seekTo: seekTime, use: nil)
         }
-        
+
         hasTakenOverPlayer = true
     }
-    
+
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        // Ensure player is paused if we are popping and not restoring immediately
-        // But HomeViewController will handle restoration in viewWillAppear
     }
 
     // MARK: - UI Setup
@@ -128,21 +131,21 @@ class DetailViewController: UIViewController {
         view.addSubview(videoContainerView)
         videoContainerView.snp.makeConstraints { make in
             make.leading.trailing.top.equalToSuperview()
-            make.height.equalToSuperview().multipliedBy(0.4) // Top 40% for video
+            make.height.equalToSuperview().multipliedBy(0.4)
         }
-        
+
         view.addSubview(backButton)
         backButton.snp.makeConstraints { make in
             make.leading.equalToSuperview().offset(16)
             make.top.equalTo(view.safeAreaLayoutGuide).offset(16)
             make.width.height.equalTo(40)
         }
-        
+
         view.addSubview(infoLabel)
         infoLabel.snp.makeConstraints { make in
             make.center.equalToSuperview()
         }
-        
+
         view.addSubview(recommendButton)
         recommendButton.snp.makeConstraints { make in
             make.centerX.equalToSuperview()
@@ -151,7 +154,7 @@ class DetailViewController: UIViewController {
             make.height.equalTo(44)
         }
     }
-    
+
     private func setupActions() {
         backButton.addTarget(self, action: #selector(backButtonTapped), for: .touchUpInside)
         recommendButton.addTarget(self, action: #selector(recommendButtonTapped), for: .touchUpInside)
@@ -159,19 +162,13 @@ class DetailViewController: UIViewController {
 
     // MARK: - Actions
 
+    /// 返回首页（通过 Coordinator，不再直接操作 navigationController）
     @objc private func backButtonTapped() {
-        navigationController?.popViewController(animated: true)
+        coordinator?.navigateBack()
     }
-    
+
+    /// 播放推荐视频（通过 Coordinator 返回首页，不再创建新 HomeVC 实例）
     @objc private func recommendButtonTapped() {
-        // Simulate playing a recommended video
-        // For testing, let's just pick a different URL or the same one but treat it as a "recommendation"
-        // Here we use a sample URL
-//        if let url = URL(string: "https://www.w3schools.com/html/mov_bbb.mp4") {
-//             DYPlayerManager.shared.play(url: url, in: videoContainerView)
-//             infoLabel.text = "Playing Recommendation..."
-//        }
-        
-        self.navigationController?.pushViewController(HomeViewController(), animated: true)
+        coordinator?.playRecommendedVideo()
     }
 }

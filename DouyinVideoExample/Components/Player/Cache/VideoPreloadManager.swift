@@ -1,38 +1,55 @@
 import Foundation
+import os.log
 
 /// 视频预加载策略管理器
 /// 负责计算预加载窗口，调用 VideoCacheManager 执行实际的预加载/取消操作
-/// 完全与具体播放器解耦，只依赖 URL
+/// 完全与具体播放器解耦；预加载任务通过注入的 `VideoCacheManager` 执行。
+///
+/// 线程安全策略：
+/// 所有可变状态通过 @MainActor 保护，移除了原有的 stateQueue，
+/// 与 VideoCacheManager 保持一致的并发模型，避免跨 actor 调用问题。
+/// 内置防抖机制，快速滑动时合并多次 updateStrategy 调用。
+@MainActor
 public class VideoPreloadManager {
-    
-    /// 全局单例访问入口
-    public static let shared = VideoPreloadManager()
-    
+
+    /// 全局单例访问入口（与 `VideoCacheManager.shared` 配对，兼容未走组合根的代码路径）
+    public static let shared = VideoPreloadManager(cache: VideoCacheManager.shared)
+
     /// 是否启用自适应预加载策略预留开关，目前仅作为配置占位
     public var isAdaptivePreloadEnabled: Bool = true
-    
+
     /// 向后预加载数量
     public var preloadNextCount: Int = 1
-    
+
     /// 向前预加载数量
     public var preloadPreviousCount: Int = 1
-    
+
     /// 单个视频预加载大小（字节），默认 2MB
     public var preloadSize: Int = 2 * 1024 * 1024
-    
+
     public var maxConcurrentPreloads: Int = 3
-    
-    private let minPreloadSize = 1 * 1024 * 1024 // 1MB
-    private let maxPreloadSize = 5 * 1024 * 1024 // 5MB
+
+    private let minPreloadSize = 1 * 1024 * 1024
+    private let maxPreloadSize = 5 * 1024 * 1024
     private var requestsSinceLastAdjustment = 0
-    private let adjustmentThreshold = 5 // 每 5 次请求尝试调整一次
-    
+    private let adjustmentThreshold = 5
+    private let adaptiveWindowSize = 20
+    private var recentPreloadOutcomes: [PreloadOutcome] = []
+
     private var preloadingUrls: Set<URL> = []
-
     private var runningPreloads: Set<URL> = []
-
+    private var preloadURLPriorityOrder: [URL] = []
     private var currentAllURLs: [URL] = []
-    
+
+    /// 上次计算时的当前索引，用于 early return 避免重复计算
+    private var lastResolvedIndex: Int?
+
+    /// 防抖工作项，快速滑动时合并多次 updateStrategy 调用
+    private var debounceWorkItem: Task<Void, Never>?
+
+    /// 防抖间隔（纳秒），在间隔内的多次调用只执行最后一次
+    private let debounceIntervalNanos: UInt64 = 150_000_000
+
     /// 发起预加载请求的总次数（不含命中缓存的情况）
     public private(set) var totalPreloadRequests: Int = 0
     /// 预加载完成的总次数
@@ -41,153 +58,212 @@ public class VideoPreloadManager {
     public private(set) var totalPreloadFailed: Int = 0
     /// 命中已缓存资源的次数（无需再次预加载）
     public private(set) var totalPreloadHits: Int = 0
-    
+
     /// 预加载命中率：命中缓存次数 / (命中缓存 + 实际请求)
     public var cacheHitRate: Double {
         let denominator = Double(totalPreloadRequests + totalPreloadHits)
-        if denominator == 0 {
-            return 0
-        }
+        if denominator == 0 { return 0 }
         return Double(totalPreloadHits) / denominator
     }
-    
+
     /// 预加载成功率：完成次数 / 请求次数
     public var preloadSuccessRate: Double {
-        if totalPreloadRequests == 0 {
-            return 0
-        }
+        if totalPreloadRequests == 0 { return 0 }
         return Double(totalPreloadCompleted) / Double(totalPreloadRequests)
     }
-    
+
     /// 预加载失败率：失败次数 / 请求次数
     public var preloadFailureRate: Double {
-        if totalPreloadRequests == 0 {
-            return 0
-        }
+        if totalPreloadRequests == 0 { return 0 }
         return Double(totalPreloadFailed) / Double(totalPreloadRequests)
     }
-    
-    private let stateQueue = DispatchQueue(label: "com.douyin.videoPreloadManager.state")
-    
+
+    private let cache: VideoCacheManager
     private let notificationCenter: NotificationCenter
-    
-    /// 私有化构造函数，确保通过 shared 访问
-    /// - Parameter notificationCenter: 注入的通知中心，默认使用系统默认中心
-    private init(notificationCenter: NotificationCenter = .default) {
+
+    private enum PreloadOutcome {
+        case success
+        case failure
+    }
+
+    /// - Parameters:
+    ///   - cache: 执行实际预加载 / 取消 / 查询缓存的实例，应与播放链路使用同一 `VideoCacheManager`。
+    ///   - notificationCenter: 注入的通知中心，默认使用系统默认中心
+    public init(cache: VideoCacheManager = .shared, notificationCenter: NotificationCenter = .default) {
+        self.cache = cache
         self.notificationCenter = notificationCenter
         notificationCenter.addObserver(self, selector: #selector(handlePreloadFinished(_:)), name: .videoCacheManagerPreloadFinished, object: nil)
         notificationCenter.addObserver(self, selector: #selector(handlePreloadFailed(_:)), name: .videoCacheManagerPreloadFailed, object: nil)
     }
-    
+
     // MARK: - Public Methods
-    
+
     /// 更新预加载策略
     /// 在列表滚动或数据刷新时调用
+    /// 内置防抖机制：快速滑动时合并多次调用，仅执行最后一次
     /// - Parameters:
     ///   - currentURL: 当前正在播放的视频 URL (可选)
     ///   - allURLs: 当前列表的所有视频 URL 数组
-    public func updateStrategy(currentURL: URL?, allURLs: [URL]) {
-        stateQueue.async { [weak self] in
-            guard let self = self else { return }
-            self.currentAllURLs = allURLs
-            
-            guard !allURLs.isEmpty else {
-                self.cancelAllOnQueue()
-                return
-            }
-            
-            let currentIndex: Int
-            if let currentURL = currentURL, let index = allURLs.firstIndex(of: currentURL) {
-                currentIndex = index
-            } else {
-                currentIndex = -1
-            }
-            
-            var targetPreloadURLs: Set<URL> = []
-            
-            if currentIndex >= 0 {
-                let startPrev = max(0, currentIndex - self.preloadPreviousCount)
-                let endPrev = currentIndex
-                if startPrev < endPrev {
-                    targetPreloadURLs.formUnion(allURLs[startPrev..<endPrev])
-                }
-                
-                let startNext = currentIndex + 1
-                let endNext = min(startNext + self.preloadNextCount, allURLs.count)
-                if startNext < endNext {
-                    targetPreloadURLs.formUnion(allURLs[startNext..<endNext])
-                }
-            } else if currentURL == nil {
-                let count = min(self.preloadNextCount, allURLs.count)
-                targetPreloadURLs.formUnion(allURLs[0..<count])
-            }
-            
-            let newInWindow = targetPreloadURLs.subtracting(self.preloadingUrls)
-            for url in newInWindow {
-                if VideoCacheManager.shared.isFullyCached(for: url) {
-                    self.totalPreloadHits += 1
-                }
-            }
-            
-            self.preloadingUrls = targetPreloadURLs
-            self.schedulePreloads()
+    ///   - currentIndex: 当前播放项在列表中的位置；传入后优先用于处理重复 URL 场景
+    public func updateStrategy(currentURL: URL?, allURLs: [URL], currentIndex: Int? = nil) {
+        debounceWorkItem?.cancel()
+
+        debounceWorkItem = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: self?.debounceIntervalNanos ?? 150_000_000)
+            guard !Task.isCancelled else { return }
+            self?.performStrategyUpdate(currentURL: currentURL, allURLs: allURLs, currentIndex: currentIndex)
         }
     }
-    
+
+    /// 实际执行策略计算（由防抖调度）
+    private func performStrategyUpdate(currentURL: URL?, allURLs: [URL], currentIndex: Int?) {
+        self.currentAllURLs = allURLs
+
+        guard !allURLs.isEmpty else {
+            self.cancelAllInternal()
+            self.lastResolvedIndex = nil
+            return
+        }
+
+        let resolvedCurrentIndex = self.resolveCurrentIndex(
+            currentURL: currentURL,
+            allURLs: allURLs,
+            currentIndex: currentIndex
+        )
+
+        if resolvedCurrentIndex == lastResolvedIndex {
+            return
+        }
+        lastResolvedIndex = resolvedCurrentIndex
+
+        let previousWindow = self.preloadingUrls
+
+        var urlSet = Set<URL>()
+        var orderedPreloadURLs: [URL] = []
+
+        func appendUnique(_ url: URL) {
+            guard !urlSet.contains(url) else { return }
+            urlSet.insert(url)
+            orderedPreloadURLs.append(url)
+        }
+
+        if let currentIndex = resolvedCurrentIndex {
+            let startNext = currentIndex + 1
+            let endNext = min(startNext + self.preloadNextCount, allURLs.count)
+            if startNext < endNext {
+                for url in allURLs[startNext..<endNext] {
+                    appendUnique(url)
+                }
+            }
+
+            let startPrev = max(0, currentIndex - self.preloadPreviousCount)
+            let endPrev = currentIndex
+            if startPrev < endPrev {
+                for index in (startPrev..<endPrev).reversed() {
+                    appendUnique(allURLs[index])
+                }
+            }
+        } else if currentURL == nil {
+            self.appendInitialPreloadWindow(from: allURLs, append: appendUnique)
+        } else {
+            self.appendInitialPreloadWindow(from: allURLs, append: appendUnique)
+        }
+
+        let newInWindow = urlSet.subtracting(previousWindow)
+        for url in newInWindow {
+            if self.cache.hasCachedData(for: url, minimumLength: self.preloadSize) || self.cache.isFullyCached(for: url) {
+                self.totalPreloadHits += 1
+            }
+        }
+
+        self.preloadingUrls = urlSet
+        self.preloadURLPriorityOrder = orderedPreloadURLs
+        self.schedulePreloads()
+    }
+
+    private func resolveCurrentIndex(currentURL: URL?, allURLs: [URL], currentIndex: Int?) -> Int? {
+        if let currentIndex = currentIndex, allURLs.indices.contains(currentIndex) {
+            if let currentURL = currentURL, allURLs[currentIndex] != currentURL {
+                return nearestIndex(of: currentURL, in: allURLs, around: currentIndex) ?? currentIndex
+            }
+            return currentIndex
+        }
+
+        guard let currentURL = currentURL else { return nil }
+        return allURLs.firstIndex(of: currentURL)
+    }
+
+    private func nearestIndex(of url: URL, in urls: [URL], around preferredIndex: Int) -> Int? {
+        urls.indices
+            .filter { urls[$0] == url }
+            .min { abs($0 - preferredIndex) < abs($1 - preferredIndex) }
+    }
+
+    private func appendInitialPreloadWindow(from allURLs: [URL], append: (URL) -> Void) {
+        let count = min(preloadNextCount, allURLs.count)
+        guard count > 0 else { return }
+
+        for url in allURLs[0..<count] {
+            append(url)
+        }
+    }
+
     /// 调度预加载任务：取消越界的，启动窗口内的，遵守并发限制
     private func schedulePreloads() {
         let toCancel = runningPreloads.subtracting(preloadingUrls)
         for url in toCancel {
-            VideoCacheManager.shared.cancelPreload(for: url)
+            cache.cancelPreload(for: url)
             runningPreloads.remove(url)
         }
 
-        let candidates = currentAllURLs.filter { url in
+        let candidates = preloadURLPriorityOrder.filter { url in
             preloadingUrls.contains(url) &&
             !runningPreloads.contains(url) &&
-            !VideoCacheManager.shared.isFullyCached(for: url)
+            !cache.isFullyCached(for: url) &&
+            !cache.hasCachedData(for: url, minimumLength: preloadSize)
         }
-        
+
         for url in candidates {
             if runningPreloads.count >= maxConcurrentPreloads {
                 break
             }
-            
-            VideoCacheManager.shared.preload(url: url, length: preloadSize)
-            totalPreloadRequests += 1
-            runningPreloads.insert(url)
+
+            if cache.preload(url: url, length: preloadSize) {
+                totalPreloadRequests += 1
+                runningPreloads.insert(url)
+            }
         }
     }
-    
+
     /// 取消所有预加载任务
     public func cancelAll() {
-        stateQueue.async { [weak self] in
-            self?.cancelAllOnQueue()
-        }
+        cancelAllInternal()
     }
-    
-    private func cancelAllOnQueue() {
-        VideoCacheManager.shared.cancelAllPreloads()
+
+    private func cancelAllInternal() {
+        cache.cancelAllPreloads()
         preloadingUrls.removeAll()
         runningPreloads.removeAll()
+        preloadURLPriorityOrder.removeAll()
         currentAllURLs.removeAll()
+        lastResolvedIndex = nil
     }
-    
+
     /// 清理所有磁盘缓存
     public func clearDiskCache() {
-        VideoCacheManager.shared.clearAllCache()
+        cache.clearAllCache()
     }
-    
+
     /// 清理指定 URL 的缓存
     public func clearCache(for url: URL) {
-        VideoCacheManager.shared.clearCache(for: url)
+        cache.clearCache(for: url)
     }
-    
+
     /// 处理预加载完成通知，累加成功计数
     @objc private func handlePreloadFinished(_ notification: Notification) {
-        stateQueue.async { [weak self] in
-            guard let self = self else { return }
+        Task { @MainActor in
             self.totalPreloadCompleted += 1
+            self.recordPreloadOutcome(.success)
             if let userInfo = notification.userInfo, let url = userInfo["url"] as? URL {
                 self.runningPreloads.remove(url)
             }
@@ -195,12 +271,12 @@ public class VideoPreloadManager {
             self.checkAndAdjustPreloadSize()
         }
     }
-    
+
     /// 处理预加载失败通知，累加失败计数
     @objc private func handlePreloadFailed(_ notification: Notification) {
-        stateQueue.async { [weak self] in
-            guard let self = self else { return }
+        Task { @MainActor in
             self.totalPreloadFailed += 1
+            self.recordPreloadOutcome(.failure)
             if let userInfo = notification.userInfo, let url = userInfo["url"] as? URL {
                 self.runningPreloads.remove(url)
             }
@@ -208,34 +284,43 @@ public class VideoPreloadManager {
             self.checkAndAdjustPreloadSize()
         }
     }
-    
+
+    private func recordPreloadOutcome(_ outcome: PreloadOutcome) {
+        recentPreloadOutcomes.append(outcome)
+        if recentPreloadOutcomes.count > adaptiveWindowSize {
+            recentPreloadOutcomes.removeFirst(recentPreloadOutcomes.count - adaptiveWindowSize)
+        }
+    }
+
     /// 根据成功/失败率动态调整预加载大小
     private func checkAndAdjustPreloadSize() {
         guard isAdaptivePreloadEnabled else { return }
-        
+
         requestsSinceLastAdjustment += 1
         if requestsSinceLastAdjustment < adjustmentThreshold {
             return
         }
         requestsSinceLastAdjustment = 0
-        
-        // 简单策略：失败率高则减小，成功率高则增加
-        // 注意：这里仅考虑最近的趋势可能会更好，但为了简单，先使用全局概率参考
-        // 实际生产中建议使用滑动窗口计算最近 N 次的成功率
-        
-        if preloadFailureRate > 0.2 {
-            // 失败率 > 20%，网络可能较差，减少预加载量
+
+        let windowCount = recentPreloadOutcomes.count
+        guard windowCount >= adjustmentThreshold else { return }
+
+        let recentFailures = recentPreloadOutcomes.filter { $0 == .failure }.count
+        let recentSuccesses = recentPreloadOutcomes.filter { $0 == .success }.count
+        let recentFailureRate = Double(recentFailures) / Double(windowCount)
+        let recentSuccessRate = Double(recentSuccesses) / Double(windowCount)
+
+        if recentFailureRate > 0.2 {
             let newSize = max(minPreloadSize, preloadSize - 512 * 1024)
             if newSize != preloadSize {
                 preloadSize = newSize
-                print("[VideoPreloadManager] Adaptive: Decreased preload size to \(preloadSize / 1024 / 1024)MB")
+                AppLog.preload.info("Adaptive: Decreased preload size to \(self.preloadSize / 1024 / 1024)MB")
             }
-        } else if preloadSuccessRate > 0.8 {
-            // 成功率 > 80%，网络状况良好，尝试增加预加载量
+        } else if recentSuccessRate > 0.8 {
             let newSize = min(maxPreloadSize, preloadSize + 512 * 1024)
             if newSize != preloadSize {
                 preloadSize = newSize
-                print("[VideoPreloadManager] Adaptive: Increased preload size to \(preloadSize / 1024 / 1024)MB")
+                AppLog.preload.info("Adaptive: Increased preload size to \(self.preloadSize / 1024 / 1024)MB")
             }
         }
     }

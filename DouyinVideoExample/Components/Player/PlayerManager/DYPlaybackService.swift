@@ -1,0 +1,76 @@
+import UIKit
+
+/// 播放控制与缓存代理（通过 `VideoCacheManager` 走代理 URL）。
+///
+/// **线程契约**：所有公开 API 须在主线程调用（`@MainActor`）。
+@MainActor
+public final class DYPlaybackService {
+
+    public static let shared = DYPlaybackService(pool: .shared)
+
+    private let pool: DYPlayerPool
+
+    /// 前向缓冲占整条视频时长的比例（0~1），在 `DYVideoPlayer` 就绪后映射为 `AVPlayerItem.preferredForwardBufferDuration`。
+    public var preloadPercentage: Double {
+        get { _preloadPercentage }
+        set { _preloadPercentage = Self.clampFraction(newValue) }
+    }
+
+    private var _preloadPercentage: Double = 0.10
+
+    public init(pool: DYPlayerPool) {
+        self.pool = pool
+        _preloadPercentage = Self.clampFraction(_preloadPercentage)
+    }
+
+    public var player: DYVideoPlayer {
+        pool.player
+    }
+
+    public func play(url: URL, in view: UIView, seekTo: TimeInterval? = nil) {
+        let p = pool.player
+        p.preferredForwardBufferFraction = Self.clampFraction(preloadPercentage)
+        AppLog.player.info("PlaybackService play direct url=\(url.absoluteString), seek=\(String(describing: seekTo)), playerState=\(String(describing: p.state))")
+        p.play(url: url, in: view, seekTo: seekTo)
+    }
+
+    public func playWithCache(
+        originalURL: URL,
+        in view: UIView,
+        seekTo: TimeInterval? = nil,
+        use targetPlayer: DYVideoPlayer? = nil
+    ) {
+        let p = targetPlayer ?? player
+        p.preferredForwardBufferFraction = Self.clampFraction(preloadPercentage)
+        let proxyURL = VideoCacheManager.shared.getProxyURL(for: originalURL)
+        AppLog.player.info("PlaybackService playWithCache original=\(originalURL.absoluteString), resolved=\(proxyURL.absoluteString), isProxy=\(proxyURL != originalURL), seek=\(String(describing: seekTo)), playerState=\(String(describing: p.state))")
+        p.play(url: proxyURL, originalURL: originalURL, in: view, seekTo: seekTo)
+    }
+
+    public func preload(originalURL: URL, use targetPlayer: DYVideoPlayer) {
+        targetPlayer.preferredForwardBufferFraction = Self.clampFraction(preloadPercentage)
+        let proxyURL = VideoCacheManager.shared.getProxyURL(for: originalURL)
+        AppLog.player.info("PlaybackService preload original=\(originalURL.absoluteString), resolved=\(proxyURL.absoluteString), isProxy=\(proxyURL != originalURL), playerState=\(String(describing: targetPlayer.state))")
+        targetPlayer.prepare(url: proxyURL, originalURL: originalURL)
+    }
+
+    public func pause() {
+        player.pause()
+    }
+
+    public func resume() {
+        player.resume()
+    }
+
+    public func stop() {
+        player.stop()
+    }
+
+    public func seek(to time: TimeInterval, isPrecise: Bool = true, completion: ((Bool) -> Void)? = nil) {
+        player.seek(to: time, isPrecise: isPrecise, completion: completion)
+    }
+
+    private static func clampFraction(_ value: Double) -> Double {
+        min(max(value, 0), 1)
+    }
+}

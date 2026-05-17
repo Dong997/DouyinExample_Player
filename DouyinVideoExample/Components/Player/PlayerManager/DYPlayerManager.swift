@@ -1,125 +1,94 @@
 import UIKit
 
-/// 播放器单例管理器 - 方便在列表滚动中使用同一个播放器实例
-public class DYPlayerManager: NSObject {
-    
-    public static let shared = DYPlayerManager()
-    
-    /// 当前“主”播放器（UI 正在展示的那个）
-    public var player: DYVideoPlayer {
-        return currentPlayer
-    }
-    
-    private var currentPlayer: DYVideoPlayer
-    private var playerPool: [DYVideoPlayer] = []
-    private let maxPoolSize = 3
-    
-    public var preloadPercentage: Double = 0.10
-    
-    private override init() {
-        let initial = DYVideoPlayer()
-        initial.isLooping = true
-        currentPlayer = initial
-        playerPool.append(initial)
-        super.init()
-    }
-    
-    /// 获取一个用于预加载的播放器（不改变 currentPlayer）
-    public func acquirePreloadPlayer() -> DYVideoPlayer {
-        if let idle = playerPool.first(where: { 
-            $0 !== currentPlayer && ($0.state == .idle || $0.state == .finished || isErrorState($0.state))
-        }) {
-            idle.reset()
-            markAsRecentlyUsed(idle)
-            return idle
-        }
-        
-        if playerPool.count < maxPoolSize {
-            let newPlayer = DYVideoPlayer()
-            newPlayer.isLooping = true
-            playerPool.append(newPlayer)
-            return newPlayer
-        }
+/// 播放编排边界：列表（Home）持有实现并向下注入，详情 / 全屏只依赖协议，不读全局单例。
+@MainActor
+public protocol DYPlaybackCoordinating: AnyObject {
+    /// 当前作为主 UI 绑定的播放器实例（与 `DYPlayerPool` 中的 current 一致）。
+    var currentPlayer: DYVideoPlayer { get }
+    var preloadPercentage: Double { get set }
 
-        let candidates = playerPool.filter { $0 !== currentPlayer }
-        
-        if let pausedVictim = candidates.first(where: { $0.state == .paused }) {
-            pausedVictim.stop()
-            pausedVictim.reset()
-            markAsRecentlyUsed(pausedVictim)
-            return pausedVictim
-        }
-        
-        if let victim = candidates.first {
-            victim.stop()
-            victim.reset()
-            markAsRecentlyUsed(victim)
-            return victim
-        }
-        
-        return currentPlayer
+    func acquirePreloadPlayer() -> DYVideoPlayer?
+    func promoteToCurrent(_ player: DYVideoPlayer)
+
+    func play(url: URL, in view: UIView, seekTo: TimeInterval?)
+    func playWithCache(originalURL: URL, in view: UIView, seekTo: TimeInterval?, use targetPlayer: DYVideoPlayer?)
+    func preload(originalURL: URL, use targetPlayer: DYVideoPlayer)
+    func pause()
+    func resume()
+    func stop()
+    func seek(to time: TimeInterval, isPrecise: Bool, completion: ((Bool) -> Void)?)
+}
+
+extension DYPlayerManager: DYPlaybackCoordinating {
+    public var currentPlayer: DYVideoPlayer { player }
+}
+
+/// 对外统一入口：组合「对象池」与「播放 / 缓存服务」。
+///
+/// **线程契约**：须在主线程使用（`@MainActor`）。新代码可直接使用 `DYPlayerPool.shared` 与 `DYPlaybackService.shared`。
+@MainActor
+public final class DYPlayerManager {
+
+    public static let shared = DYPlayerManager()
+
+    private let pool = DYPlayerPool.shared
+    private let playback = DYPlaybackService.shared
+
+    public var player: DYVideoPlayer {
+        pool.player
     }
-    
-    private func markAsRecentlyUsed(_ player: DYVideoPlayer) {
-        if let index = playerPool.firstIndex(of: player) {
-            playerPool.remove(at: index)
-            playerPool.append(player)
-        }
+
+    public var preloadPercentage: Double {
+        get { playback.preloadPercentage }
+        set { playback.preloadPercentage = newValue }
     }
-    
-    private func isErrorState(_ state: DYPlayerState) -> Bool {
-        if case .error = state { return true }
-        return false
+
+    private init() {}
+
+    // MARK: - Pool
+
+    /// 若返回 `nil`，表示没有独立预加载槽位，仅适合跳过预加载；若要立刻播放入口请使用 `player` 或 `acquirePreloadPlayer() ?? player`。
+    public func acquirePreloadPlayer() -> DYVideoPlayer? {
+        pool.acquirePreloadPlayer()
     }
-    
-    /// 将某个预加载播放器提升为当前主播放器
+
     public func promoteToCurrent(_ player: DYVideoPlayer) {
-        if player !== currentPlayer {
-            currentPlayer = player
-            markAsRecentlyUsed(player)
-        }
+        pool.promoteToCurrent(player)
     }
-    
+
+    // MARK: - Playback
+
     public func play(url: URL, in view: UIView, seekTo: TimeInterval? = nil) {
-        player.play(url: url, in: view, seekTo: seekTo)
+        playback.play(url: url, in: view, seekTo: seekTo)
     }
-    
-    public func playWithCache(originalURL: URL, in view: UIView, seekTo: TimeInterval? = nil, use targetPlayer: DYVideoPlayer? = nil) {
-        let p = targetPlayer ?? self.player
-        let proxyURL = VideoCacheManager.shared.getProxyURL(for: originalURL)
-        // 传递 originalURL 以便后续重试逻辑使用
-        p.play(url: proxyURL, originalURL: originalURL, in: view, seekTo: seekTo)
+
+    public func playWithCache(
+        originalURL: URL,
+        in view: UIView,
+        seekTo: TimeInterval? = nil,
+        use targetPlayer: DYVideoPlayer? = nil
+    ) {
+        playback.playWithCache(originalURL: originalURL, in: view, seekTo: seekTo, use: targetPlayer)
     }
-    
-    /// 预加载指定视频（不自动播放）
+
+    /// 使用指定播放器实例对资源做 `prepare`（会走缓存代理）。列表邻条预取应优先用 `VideoPreloadManager` + `VideoCacheManager.preload`，避免与 HTTP Range 预拉重复；本方法保留给需要「播放器已就绪」的场景。
     public func preload(originalURL: URL, use targetPlayer: DYVideoPlayer) {
-        let proxyURL = VideoCacheManager.shared.getProxyURL(for: originalURL)
-        targetPlayer.prepare(url: proxyURL, originalURL: originalURL)
+        playback.preload(originalURL: originalURL, use: targetPlayer)
     }
-    
-    /// 暂停
+
     public func pause() {
-        player.pause()
+        playback.pause()
     }
-    
-    /// 恢复
+
     public func resume() {
-        player.resume()
+        playback.resume()
     }
-    
-    /// 停止
+
     public func stop() {
-        player.stop()
+        playback.stop()
     }
-    
-    /// 跳转到指定时间
-    /// - Parameters:
-    ///   - time: 目标时间 (秒)
-    ///   - isPrecise: 是否精确跳转。
-    ///     - true: 精确跳转 (tolerance = zero)，适用于用户停止拖拽后的最终定位。
-    ///     - false: 快速跳转 (tolerance = infinity)，适用于用户正在拖拽进度条时的实时预览，性能更好。
-    ///   - completion: 完成回调
+
     public func seek(to time: TimeInterval, isPrecise: Bool = true, completion: ((Bool) -> Void)? = nil) {
-        player.seek(to: time, isPrecise: isPrecise, completion: completion)
+        playback.seek(to: time, isPrecise: isPrecise, completion: completion)
     }
 }

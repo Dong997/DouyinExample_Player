@@ -5,29 +5,13 @@ import UIKit
 // MARK: - Player State
 /// 播放器状态枚举
 public enum DYPlayerState: Equatable {
-    case idle           // 闲置/未初始化
-    case preparing      // 准备中(加载资源)
-    case buffering      // 缓冲中
-    case playing        // 播放中
-    case paused         // 暂停
-    case finished       // 播放完成
-    case error(String)  // 出错(包含错误信息)
-    
-    public static func == (lhs: DYPlayerState, rhs: DYPlayerState) -> Bool {
-        switch (lhs, rhs) {
-        case (.idle, .idle),
-             (.preparing, .preparing),
-             (.buffering, .buffering),
-             (.playing, .playing),
-             (.paused, .paused),
-             (.finished, .finished):
-            return true
-        case (.error(let a), .error(let b)):
-            return a == b
-        default:
-            return false
-        }
-    }
+    case idle
+    case preparing
+    case buffering
+    case playing
+    case paused
+    case finished
+    case error(String)
 }
 
 public extension DYPlayerState {
@@ -104,6 +88,8 @@ public extension DYVideoPlayerDelegate {
 public protocol DYVideoPlayerInput {
     
     var delegate: DYVideoPlayerDelegate? { get set }
+    /// 多播委托中心，允许多个订阅者同时接收播放器事件
+    var multicastDelegate: DYVideoPlayerMulticastDelegate { get }
     var isMuted: Bool { get set }
     var volume: Float { get set }
     var isLooping: Bool { get set }
@@ -162,3 +148,15 @@ public protocol DYVideoAdvancedControlInput: DYVideoPlayerInput {
     /// - Parameter gravity: 目标填充模式
     func setVideoGravity(_ gravity: DYVideoGravity)
 }
+
+/// 列表 / 详情等场景下需要在不同容器间迁移播放器 UI 时使用的能力。
+/// 由 `DYVideoPlayer` 实现，通过初始化参数注入，避免子页面直接访问全局 `DYPlayerManager`。
+public protocol DYVideoPlayerSession: DYVideoAdvancedControlInput {
+    var containerView: UIView? { get }
+    var originalURL: URL? { get }
+    var currentURL: URL? { get }
+    func updateContainer(_ view: UIView)
+    func isPlaying(url: URL) -> Bool
+}
+
+extension DYVideoPlayer: DYVideoPlayerSession {}

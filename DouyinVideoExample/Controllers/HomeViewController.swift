@@ -2,22 +2,58 @@ import UIKit
 import SnapKit
 import Combine
 
-class HomeViewController: UIViewController {
-    
-    // MARK: - Properties
-    
-    private let viewModel = HomeViewModel()
-    private let retryHandler = PlaybackRetryHandler()
+/// 首页控制器
+/// 职责仅限于：
+/// 1. UI 布局与构建
+/// 2. CollectionView 数据源/代理
+/// 3. 将用户交互转发给 ViewModel
+/// 4. 订阅 ViewModel 的 Published 属性驱动 UI 更新
+/// 5. 通过 Coordinator 处理导航（不直接 push/present）
+class HomeViewController: UIViewController, DYOrientationConfigurable {
+
+    // MARK: - Dependencies
+
+    private let viewModel: HomeViewModel
+    private let playback: DYPlaybackCoordinating
+    private let videoCache: VideoCacheManager
     private var cancellables = Set<AnyCancellable>()
-    private var currentPlayingIndexPath: IndexPath?
-    private var playerMap: [Int: DYVideoPlayer] = [:] // 管理预加载的播放器实例
-    private var isDraggingProgress = false
-    private var fullscreenTransitioningDelegate: FullscreenVideoTransitioningDelegate?
+
+    /// 标记是否已触发首次视频播放，避免 reloadData 后硬编码延迟
+    private var hasPlayedFirstVideo = false
+
+    /// 首次自动播放重试任务。首次启动时数据、布局、cell 创建可能不在同一个 runloop 完成。
+    private var firstAutoplayWorkItem: DispatchWorkItem?
+
+    /// 滚动停止后的播放确认任务。快速滑动结束时，分页定位、cell 复用、预加载绑定可能跨几个 runloop 完成。
+    private var scrollEndPlaybackWorkItem: DispatchWorkItem?
+
+    /// 当前滚动中检测到的目标播放索引，避免 scrollViewDidScroll 重复触发
+    private var pendingPlayIndexPath: IndexPath?
+
+    /// 上一次 scrollViewDidScroll 记录的 contentOffset.y，用于计算滚动速度
+    private var lastContentOffsetY: CGFloat = 0
+
+    /// 上一次 scrollViewDidScroll 的时间戳，用于计算滚动速度
+    private var lastScrollTime: TimeInterval = 0
+
+    /// 判定为"快速滚动"的速度阈值（points/秒），超过此值时延迟播放
+    private let fastScrollVelocityThreshold: CGFloat = 800
+
+    /// 当前正在播放视频的 Cell 弱引用
+    /// 避免通过 cellForItem(at:) 查找时因 Cell 未就绪/已回收导致封面图无法隐藏
+    private weak var currentPlayingCell: VideoCell?
+
+    /// 导航协调器，由 HomeCoordinator 注入
+    weak var coordinator: HomeCoordinator?
+
+    // MARK: - UI Components
+
     private let bottomBar: UIView = {
         let barView = UIView()
         barView.backgroundColor = UIColor.gray
         return barView
     }()
+
     private let bottomStack: UIStackView = {
         let stackView = UIStackView()
         stackView.axis = .horizontal
@@ -26,7 +62,7 @@ class HomeViewController: UIViewController {
         stackView.spacing = 24
         return stackView
     }()
-    
+
     private lazy var collectionView: UICollectionView = {
         let layout = UICollectionViewFlowLayout()
         layout.itemSize = .zero
@@ -34,41 +70,61 @@ class HomeViewController: UIViewController {
         layout.minimumLineSpacing = 0
         layout.sectionInset = .zero
         layout.scrollDirection = .vertical
-        
-        let collectionViewInstance = UICollectionView(frame: .zero, collectionViewLayout: layout)
-        collectionViewInstance.backgroundColor = .black
-        collectionViewInstance.delegate = self
-        collectionViewInstance.dataSource = self
-        collectionViewInstance.isPagingEnabled = true
-        collectionViewInstance.contentInsetAdjustmentBehavior = .never
-        collectionViewInstance.register(VideoCell.self, forCellWithReuseIdentifier: VideoCell.identifier)
-        return collectionViewInstance
+
+        let cv = UICollectionView(frame: .zero, collectionViewLayout: layout)
+        cv.backgroundColor = .black
+        cv.delegate = self
+        cv.dataSource = self
+        cv.isPagingEnabled = true
+        cv.contentInsetAdjustmentBehavior = .never
+        cv.register(VideoCell.self, forCellWithReuseIdentifier: VideoCell.identifier)
+        return cv
     }()
-    
+
+    // MARK: - Initialization
+    init(
+        viewModel: HomeViewModel? = nil,
+        playback: DYPlaybackCoordinating = DYPlayerManager.shared,
+        videoCache: VideoCacheManager = .shared
+    ) {
+        self.viewModel = viewModel ?? HomeViewModel()
+        self.playback = playback
+        self.videoCache = videoCache
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @MainActor
+    required init?(coder: NSCoder) {
+        self.viewModel = HomeViewModel()
+        self.playback = DYPlayerManager.shared
+        self.videoCache = .shared
+        super.init(coder: coder)
+    }
+
     // MARK: - Lifecycle
-    
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .gray
-        
-        VideoCacheManager.shared.clearAllCache()
-        // 启动视频缓存代理服务
-        VideoCacheManager.shared.start()
-        
-        // 设置播放器代理
-        DYPlayerManager.shared.player.delegate = self
-        
-        // 启用侧滑返回手势
+
+        videoCache.clearAllCache()
+        videoCache.start()
+
         navigationController?.interactivePopGestureRecognizer?.delegate = self
         navigationController?.interactivePopGestureRecognizer?.isEnabled = true
-        
+
         setupUI()
         bindViewModel()
     }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        checkAndRestorePlayer()
+        restorePlayerIfNeeded()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        scheduleAutoplayForVisibleVideoIfNeeded()
     }
 
     override func viewDidLayoutSubviews() {
@@ -81,64 +137,17 @@ class HomeViewController: UIViewController {
             }
         }
     }
-    
+
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        // 只有当播放器还在当前页面（是 collectionView 的子视图）时才暂停
-        // 如果已经跳转到详情页，播放器已经被详情页接管（containerView 变了），此时不应暂停
-        let player = DYPlayerManager.shared.player
+        let player = viewModel.currentPlayer
         if let container = player.containerView, container.isDescendant(of: collectionView) {
             player.pause()
         }
     }
-    
-    // MARK: - Orientation Support
-    
-    // MARK: - Private Methods
-    
-    private func checkAndRestorePlayer() {
-        guard let indexPath = currentPlayingIndexPath,
-              let cell = collectionView.cellForItem(at: indexPath) as? VideoCell,
-              viewModel.videos.indices.contains(indexPath.item) else {
-            return
-        }
-        
-        let video = viewModel.videos[indexPath.item]
-        let player = DYPlayerManager.shared.player
-        
-        // 恢复代理 (防止详情页修改了代理)
-        player.delegate = self
-        
-        // 检查播放器是否被挪用（容器不一致）
-        if player.containerView !== cell.playerContainerView {
-            // 判断是否是同一个视频
-            let isSameVideo: Bool
-            if let original = player.originalURL {
-                isSameVideo = (original == video.videoURL)
-            } else if let current = player.currentURL {
-                isSameVideo = (current == video.videoURL)
-            } else {
-                isSameVideo = false
-            }
-            
-            if isSameVideo {
-                // 1. 同视频：无缝拿回播放器
-                player.updateContainer(cell.playerContainerView)
-                if player.state != .playing {
-                    player.resume()
-                }
-            } else {
-                // 2. 不同视频：重新加载当前视频
-                playVideo(at: indexPath)
-            }
-        } else {
-            // 容器一致，仅确保恢复播放
-            if player.state != .playing {
-                player.resume()
-            }
-        }
-    }
-    
+
+    // MARK: - UI Setup
+
     private func setupUI() {
         view.addSubview(bottomBar)
         bottomBar.snp.makeConstraints { make in
@@ -166,25 +175,6 @@ class HomeViewController: UIViewController {
         let me = makeTabItem(image: UIImage(systemName: "person.crop.circle"), title: "我")
         [home, friends, plus, messages, me].forEach { bottomStack.addArrangedSubview($0) }
     }
-    
-    private func bindViewModel() {
-        viewModel.$videos
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] videos in
-                guard let self = self else { return }
-                let currentCount = self.collectionView.numberOfItems(inSection: 0)
-                if currentCount != videos.count {
-                    self.collectionView.reloadData()
-                    if !videos.isEmpty {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            let indexPath = IndexPath(item: 0, section: 0)
-                            self.playVideo(at: indexPath)
-                        }
-                    }
-                }
-            }
-            .store(in: &cancellables)
-    }
 
     private func makeTabItem(image: UIImage?, title: String, highlighted: Bool = false) -> UIStackView {
         let imageView = UIImageView(image: image)
@@ -201,180 +191,248 @@ class HomeViewController: UIViewController {
         stack.spacing = 4
         return stack
     }
-    
-    private func playVideo(at indexPath: IndexPath) {
+
+    // MARK: - Binding
+
+    private func bindViewModel() {
+        // 播放器开始播放时直接隐藏封面图（绕过 Combine receive(on:) 延迟）
+        viewModel.onPlayerStartPlaying = { [weak self] in
+            self?.fadeOutCoverImage()
+        }
+
+        viewModel.$videos
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] videos in
+                guard let self = self else { return }
+                let currentCount = self.collectionView.numberOfItems(inSection: 0)
+                AppLog.ui.info("Home videos update oldCount=\(currentCount), newCount=\(videos.count), windowReady=\(self.view.window != nil)")
+               
+                if currentCount != videos.count {
+                    self.hasPlayedFirstVideo = false
+                    self.collectionView.reloadData()
+                    self.scheduleAutoplayForVisibleVideoIfNeeded()
+                }
+            }
+            .store(in: &cancellables)
+
+        viewModel.$playerState
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                AppLog.ui.info("Home observed playerState=\(String(describing: state)), currentIndex=\(String(describing: self?.viewModel.currentPlayingIndexPath))")
+                self?.updateCurrentCellControlView { controlView in
+                    controlView.updateCenterBtnState(state)
+                }
+                if state == .playing {
+                    self?.hasPlayedFirstVideo = true
+                    self?.firstAutoplayWorkItem?.cancel()
+                    self?.firstAutoplayWorkItem = nil
+                    self?.fadeOutCoverImage()
+                }
+            }
+            .store(in: &cancellables)
+
+        viewModel.$progressInfo
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] info in
+                self?.updateCurrentCellControlView { controlView in
+                    controlView.updateProgress(currentTime: info.currentTime, totalTime: info.totalTime)
+                }
+            }
+            .store(in: &cancellables)
+
+        viewModel.$bufferProgress
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] progress in
+                self?.updateCurrentCellControlView { controlView in
+                    controlView.updateBuffer(progress: progress)
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    // MARK: - Player Control（通过 ViewModel 间接调用 PlayerCoordinator）
+
+    @discardableResult
+    private func playVideo(at indexPath: IndexPath) -> Bool {
+        guard let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return false }
+        return playVideo(at: indexPath, with: cell)
+    }
+
+    @discardableResult
+    private func playVideo(at indexPath: IndexPath, with cell: VideoCell) -> Bool {
         let index = indexPath.item
-        guard viewModel.videos.indices.contains(index) else { return }
-        
-        // 1. 如果切换了视频，先处理上一个视频
-        if let current = currentPlayingIndexPath, current != indexPath {
-            let time = DYPlayerManager.shared.player.currentTime
-            viewModel.updateResumeTime(for: current.item, time: time)
-            // 暂停旧播放器
-            DYPlayerManager.shared.player.pause()
-        }
-        
-        currentPlayingIndexPath = indexPath
-        guard let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
+        guard viewModel.videos.indices.contains(index) else { return false }
         let video = viewModel.videos[index]
-        
-        // 2. 获取或创建播放器
-        let player: DYVideoPlayer
-        if let existing = playerMap[index] {
-            player = existing
-            print("⚡️ Hit preload player for index: \(index)")
+
+        currentPlayingCell = cell
+        AppLog.ui.info("Home playVideo begin index=\(index), url=\(video.videoURL.lastPathComponent), cellBounds=\(String(describing: cell.bounds)), containerBounds=\(String(describing: cell.playerContainerView.bounds))")
+
+        viewModel.playVideo(at: indexPath, containerView: cell.playerContainerView)
+
+        let player = viewModel.currentPlayer
+        AppLog.ui.info("Home playVideo requested index=\(index), playerState=\(String(describing: player.state)), playerURL=\(String(describing: player.currentURL?.absoluteString)), originalURL=\(String(describing: player.originalURL?.absoluteString))")
+        if player.state == .playing {
+            // 播放器已在播放（预加载命中），立即隐藏封面图
+            cell.hideCoverImage(animated: true)
         } else {
-            player = DYPlayerManager.shared.acquirePreloadPlayer()
-            playerMap[index] = player
-            print("🐢 Acquire new player for index: \(index)")
+            // 播放器尚未就绪，显示封面图等待播放器画面渲染
+            cell.showCoverImage()
         }
-        
-        // 3. 提升为 Current Player 并绑定
-        DYPlayerManager.shared.promoteToCurrent(player)
-        player.delegate = self
-        
-        let isSameVideo: Bool
-        if let originalURL = player.originalURL {
-            isSameVideo = (originalURL == video.videoURL)
-        } else if let currentURL = player.currentURL {
-            isSameVideo = (currentURL == video.videoURL)
-        } else {
-            isSameVideo = false
-        }
-        if isSameVideo, player.containerView !== cell.playerContainerView {
-            player.updateContainer(cell.playerContainerView)
-        }
-        
+
         cell.controlView.delegate = self
-        // 立即更新 UI 状态
-        // 优化：切换视频时，即使播放器处于 Paused（预加载完成状态），UI 上也应视为准备播放（隐藏暂停按钮）
-        // 避免出现“先显示暂停图标，然后立即消失”的闪烁
-        if player.state == .paused {
-            cell.controlView.updateCenterBtnState(.preparing)
-        }else if player.state == .idle{
+        if player.state == .paused || player.state == .idle {
             cell.controlView.updateCenterBtnState(.preparing)
         } else {
             cell.controlView.updateCenterBtnState(player.state)
         }
         cell.controlView.updateProgress(currentTime: player.currentTime, totalTime: player.duration)
-        
-        // 点击标题跳转详情页
+
         cell.onTitleTapped = { [weak self] in
             guard let self = self else { return }
-            let currentTime = DYPlayerManager.shared.player.currentTime
-            let detailVC = DetailViewController(videoURL: video.videoURL, seekTime: currentTime)
-            self.navigationController?.pushViewController(detailVC, animated: true)
+            let currentTime = self.viewModel.currentPlayer.currentTime
+            self.coordinator?.showDetail(
+                videoURL: video.videoURL,
+                seekTime: currentTime,
+                player: self.viewModel.currentPlayer
+            )
         }
-        
-        // 4. 播放 (如果已预加载，playWithCache 内部会直接 resume)
-        // 注意：playWithCache 内部默认使用 shared.player，现在我们已经 promote 过了，所以没问题。
-        // 但为了保险，我们可以扩展 playWithCache 接受 player 参数，或者依靠 promoteToCurrent 的副作用。
-        // 我们刚刚修改了 playWithCache 支持 use 参数，这里显式传入更清晰。
-        if video.resumeTime > 0 {
-            DYPlayerManager.shared.playWithCache(originalURL: video.videoURL, in: cell.playerContainerView, seekTo: video.resumeTime, use: player)
-        } else {
-            DYPlayerManager.shared.playWithCache(originalURL: video.videoURL, in: cell.playerContainerView, use: player)
-        }
-        
-        // 5. 更新预加载策略 (数据层)
-        let allURLs = viewModel.videos.map { $0.videoURL }
-        VideoPreloadManager.shared.updateStrategy(currentURL: video.videoURL, allURLs: allURLs)
-        
-        // 6. 触发下一个视频的播放器预加载
-        managePreloadPlayers(currentIndex: index)
+        return true
     }
-    
-    private func managePreloadPlayers(currentIndex: Int) {
-        // 新策略：保留上一个、当前、下一个
-        var keepIndices = Set([currentIndex])
-        if currentIndex + 1 < viewModel.videos.count {
-            keepIndices.insert(currentIndex + 1)
+
+    private func restorePlayerIfNeeded() {
+        guard let indexPath = viewModel.currentPlayingIndexPath,
+              let cell = collectionView.cellForItem(at: indexPath) as? VideoCell,
+              viewModel.videos.indices.contains(indexPath.item) else {
+            return
         }
-        if currentIndex - 1 >= 0 {
-            keepIndices.insert(currentIndex - 1)
-        }
-        
-        // 清理不再需要的播放器
-        let keysToRemove = playerMap.keys.filter { !keepIndices.contains($0) }
-        for key in keysToRemove {
-            if let p = playerMap.removeValue(forKey: key) {
-                if p !== DYPlayerManager.shared.player {
-                    p.stop()
-                    p.reset()
-                }
+        viewModel.restorePlayer(at: indexPath, containerView: cell.playerContainerView)
+    }
+
+    private func scheduleAutoplayForVisibleVideoIfNeeded(retryCount: Int = 40) {
+        firstAutoplayWorkItem?.cancel()
+        AppLog.ui.info("Home schedule autoplay retryCount=\(retryCount), videos=\(self.viewModel.videos.count), windowReady=\(self.view.window != nil), hasPlayedFirstVideo=\(self.hasPlayedFirstVideo)")
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            if self.attemptAutoplayForVisibleVideoIfNeeded() {
+                return
             }
+            guard retryCount > 0 else { return }
+            self.scheduleAutoplayForVisibleVideoIfNeeded(retryCount: retryCount - 1)
         }
-        
-        // 预加载下一个
-        let nextIndex = currentIndex + 1
-        preloadVideo(at: nextIndex)
-        
-        // 预加载上一个
-        let prevIndex = currentIndex - 1
-        preloadVideo(at: prevIndex)
+        firstAutoplayWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
     }
-    
-    private func preloadVideo(at index: Int) {
-        guard viewModel.videos.indices.contains(index) else { return }
-        if playerMap[index] != nil { return } // 已在预加载
-        
-        let player = DYPlayerManager.shared.acquirePreloadPlayer()
-        playerMap[index] = player
-        
-        let video = viewModel.videos[index]
-        print("🚀 Preloading player for index: \(index)")
-        // 绑定 delegate 也可以监听预加载状态，但要小心不要干扰当前 UI
-        // 这里暂不绑定 delegate，因为 DYVideoPlayer 的 prepare 已经足够
-        // 如果需要监听错误，可以绑定，但在回调里要 filter
-        DYPlayerManager.shared.preload(originalURL: video.videoURL, use: player)
+
+    @discardableResult
+    private func attemptAutoplayForVisibleVideoIfNeeded() -> Bool {
+        guard isViewLoaded, view.window != nil, !viewModel.videos.isEmpty else {
+            AppLog.ui.info("Home autoplay skipped loaded=\(self.isViewLoaded), windowReady=\(self.view.window != nil), videos=\(self.viewModel.videos.count)")
+            return false
+        }
+        if viewModel.currentPlayer.state == .playing {
+            hasPlayedFirstVideo = true
+            AppLog.ui.info("Home autoplay already playing")
+            return true
+        }
+
+        view.layoutIfNeeded()
+        collectionView.layoutIfNeeded()
+
+        let visibleRect = CGRect(origin: collectionView.contentOffset, size: collectionView.bounds.size)
+        let visiblePoint = CGPoint(x: visibleRect.midX, y: visibleRect.midY)
+
+        if let indexPath = collectionView.indexPathForItem(at: visiblePoint),
+           let cell = collectionView.cellForItem(at: indexPath) as? VideoCell {
+            AppLog.ui.info("Home autoplay attempt index=\(indexPath.item), visiblePoint=\(String(describing: visiblePoint)), bounds=\(String(describing: self.collectionView.bounds)), offset=\(String(describing: self.collectionView.contentOffset))")
+            _ = playVideo(at: indexPath, with: cell)
+            return viewModel.currentPlayer.state == .playing
+        }
+        AppLog.ui.warning("Home autoplay no visible cell at point=\(String(describing: visiblePoint)), bounds=\(String(describing: self.collectionView.bounds)), visibleCells=\(self.collectionView.visibleCells.count)")
+        return false
     }
 
     private func presentFullscreen(for indexPath: IndexPath) {
         guard viewModel.videos.indices.contains(indexPath.item) else { return }
         guard let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
         let video = viewModel.videos[indexPath.item]
-        let currentTime = DYPlayerManager.shared.player.currentTime
+        let currentTime = viewModel.currentPlayer.currentTime
         let horizontalAspectRatio = video.aspectRatio ?? 1.1
         let fullscreenOrientationMask: UIInterfaceOrientationMask = horizontalAspectRatio > 1.0 ? .landscapeRight : .portrait
-        let fullscreenViewController = FullscreenVideoViewController(
+
+        coordinator?.presentFullscreen(
             videoURL: video.videoURL,
             currentTime: currentTime,
             aspectRatio: video.aspectRatio,
-            fullscreenOrientationMask: fullscreenOrientationMask,
-            player: DYPlayerManager.shared.player
-        )
-        fullscreenViewController.onDismiss = { [weak self] in
-            guard let self = self else { return }
-            DYPlayerManager.shared.player.delegate = self
-            self.bottomBar.isHidden = false
-            self.collectionView.isHidden = false
-            self.restorePlayerAfterFullscreen(at: indexPath)
-        }
-        let transitionDelegate = FullscreenVideoTransitioningDelegate(
+            orientationMask: fullscreenOrientationMask,
+            player: viewModel.currentPlayer,
             originView: cell.playerContainerView,
-            fullscreenOrientationMask: fullscreenOrientationMask
+            onDismiss: { [weak self] in
+                guard let self = self else { return }
+                self.bottomBar.isHidden = false
+                self.collectionView.isHidden = false
+                self.restoreAfterFullscreen(at: indexPath)
+            }
         )
-        fullscreenTransitioningDelegate = transitionDelegate
-        fullscreenViewController.transitioningDelegate = transitionDelegate
-        fullscreenViewController.modalPresentationStyle = .fullScreen
-        present(fullscreenViewController, animated: true, completion: nil)
     }
 
-    private func restorePlayerAfterFullscreen(at indexPath: IndexPath) {
+    private func restoreAfterFullscreen(at indexPath: IndexPath) {
         guard viewModel.videos.indices.contains(indexPath.item) else { return }
-        let video = viewModel.videos[indexPath.item]
-        let currentTime = DYPlayerManager.shared.player.currentTime
         if let cell = collectionView.cellForItem(at: indexPath) as? VideoCell {
             cell.controlView.delegate = self
-            DYPlayerManager.shared.playWithCache(originalURL: video.videoURL, in: cell.playerContainerView, seekTo: currentTime)
+            viewModel.restoreAfterFullscreen(at: indexPath, containerView: cell.playerContainerView)
             cell.controlView.updateCenterBtnState(.playing)
         } else {
             collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: false)
             collectionView.layoutIfNeeded()
             if let cell = collectionView.cellForItem(at: indexPath) as? VideoCell {
                 cell.controlView.delegate = self
-                DYPlayerManager.shared.playWithCache(originalURL: video.videoURL, in: cell.playerContainerView, seekTo: currentTime)
+                viewModel.restoreAfterFullscreen(at: indexPath, containerView: cell.playerContainerView)
                 cell.controlView.updateCenterBtnState(.playing)
+            }
+        }
+    }
+
+    // MARK: - UI Helper
+
+    /// 获取当前播放 Cell 的控制视图并执行闭包更新，避免重复的 guard-let-cell 模式
+    private func updateCurrentCellControlView(_ update: (DYPlayerControlView) -> Void) {
+        guard let indexPath = viewModel.currentPlayingIndexPath,
+              let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
+        update(cell.controlView)
+    }
+
+    /// 播放器就绪后淡出封面图，实现「封面→视频画面」的无缝过渡
+    /// 抖音做法：视频画面渲染后，封面图以 0.3s 动画淡出
+    /// 优先使用存储的 currentPlayingCell 弱引用，避免 cellForItem(at:) 找不到 Cell
+    private func fadeOutCoverImage() {
+        if let cell = currentPlayingCell {
+            cell.hideCoverImage(animated: true)
+            return
+        }
+        // 兜底：弱引用失效时回退到 cellForItem(at:) 查找
+        guard let indexPath = viewModel.currentPlayingIndexPath,
+              let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
+        cell.hideCoverImage(animated: true)
+    }
+
+    // MARK: - Recommended Video
+
+    /// 加载更多视频数据并播放第一条推荐视频
+    /// 由 DetailCoordinator 通过 HomeCoordinator 触发
+    func playRecommendedVideo() {
+        let moreVideos = VideoModel.moreData()
+        let startIndex = viewModel.videos.count
+        viewModel.videos.append(contentsOf: moreVideos)
+        collectionView.reloadData()
+
+        let targetIndexPath = IndexPath(item: startIndex, section: 0)
+        collectionView.scrollToItem(at: targetIndexPath, at: .centeredVertically, animated: true)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self = self else { return }
+            if self.collectionView.cellForItem(at: targetIndexPath) is VideoCell {
+                self.playVideo(at: targetIndexPath)
             }
         }
     }
@@ -383,167 +441,181 @@ class HomeViewController: UIViewController {
 // MARK: - UICollectionViewDelegate & DataSource
 
 extension HomeViewController: UICollectionViewDelegate, UICollectionViewDataSource {
+
     func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
         return viewModel.videos.count
     }
-    
+
     func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
         let cell = collectionView.dequeueReusableCell(withReuseIdentifier: VideoCell.identifier, for: indexPath) as! VideoCell
         cell.configure(with: viewModel.videos[indexPath.item])
         return cell
     }
-    
+
     func collectionView(_ collectionView: UICollectionView, willDisplay cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
         guard let videoCell = cell as? VideoCell else { return }
         let index = indexPath.item
-        if let player = playerMap[index] {
-            let video = viewModel.videos[index]
-            let isSameVideo: Bool
-            if let originalURL = player.originalURL {
-                isSameVideo = (originalURL == video.videoURL)
-            } else if let currentURL = player.currentURL {
-                isSameVideo = (currentURL == video.videoURL)
-            } else {
-                isSameVideo = false
-            }
-            if isSameVideo, player.containerView !== videoCell.playerContainerView {
-                player.updateContainer(videoCell.playerContainerView)
-            }
+        if let player = viewModel.bindPreloadedPlayerIfNeeded(at: index, containerView: videoCell.playerContainerView) {
             if player.state == .paused || player.state == .idle {
                 videoCell.controlView.updateCenterBtnState(.preparing)
             }
-        } else {
-            preloadVideo(at: index)
+        }
+
+        if viewModel.currentPlayingIndexPath == indexPath, viewModel.currentPlayer.state != .playing {
+            AppLog.ui.info("Home willDisplay resumes current index=\(index), state=\(String(describing: self.viewModel.currentPlayer.state))")
+            _ = playVideo(at: indexPath, with: videoCell)
+        }
+
+        if !hasPlayedFirstVideo, indexPath.item == 0 {
+            AppLog.ui.info("Home willDisplay triggers first play index=0")
+            _ = playVideo(at: indexPath, with: videoCell)
+            hasPlayedFirstVideo = viewModel.currentPlayer.state == .playing
+            if hasPlayedFirstVideo {
+                firstAutoplayWorkItem?.cancel()
+                firstAutoplayWorkItem = nil
+            }
         }
     }
 
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
-        // Tap to pause/resume
-        let player = DYPlayerManager.shared.player
-        if player.state == .playing {
-            player.pause()
-        } else {
-            player.resume()
-        }
+        viewModel.togglePlayPause()
     }
-    
+
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        
-    }
-    
-    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
         let visibleRect = CGRect(origin: collectionView.contentOffset, size: collectionView.bounds.size)
         let visiblePoint = CGPoint(x: visibleRect.midX, y: visibleRect.midY)
-        
-        if let indexPath = collectionView.indexPathForItem(at: visiblePoint) {
-            if currentPlayingIndexPath != indexPath {
-                playVideo(at: indexPath)
+        guard let targetIndexPath = collectionView.indexPathForItem(at: visiblePoint) else { return }
+
+        guard targetIndexPath != viewModel.currentPlayingIndexPath && targetIndexPath != pendingPlayIndexPath else { return }
+
+        let now = CACurrentMediaTime()
+        let deltaY = abs(scrollView.contentOffset.y - lastContentOffsetY)
+        let deltaTime = now - lastScrollTime
+        let velocity: CGFloat = deltaTime > 0 ? deltaY / CGFloat(deltaTime) : 0
+
+        lastContentOffsetY = scrollView.contentOffset.y
+        lastScrollTime = now
+
+        pendingPlayIndexPath = targetIndexPath
+
+        if velocity < fastScrollVelocityThreshold {
+            playVideo(at: targetIndexPath)
+        }
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        schedulePlayVideoForVisibleCenter()
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        if !decelerate {
+            schedulePlayVideoForVisibleCenter()
+        }
+    }
+
+    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        schedulePlayVideoForVisibleCenter()
+    }
+
+    private func schedulePlayVideoForVisibleCenter(retryCount: Int = 6) {
+        scrollEndPlaybackWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            if self.playVideoForVisibleCenter() {
+                return
             }
+            guard retryCount > 0 else { return }
+            self.schedulePlayVideoForVisibleCenter(retryCount: retryCount - 1)
+        }
+        scrollEndPlaybackWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: workItem)
+    }
+
+    /// 滚动结束后播放可视区域中心对应的视频，并重置速度追踪状态
+    @discardableResult
+    private func playVideoForVisibleCenter() -> Bool {
+        pendingPlayIndexPath = nil
+        lastContentOffsetY = 0
+        lastScrollTime = 0
+
+        collectionView.layoutIfNeeded()
+        let visibleRect = CGRect(origin: collectionView.contentOffset, size: collectionView.bounds.size)
+        let visiblePoint = CGPoint(x: visibleRect.midX, y: visibleRect.midY)
+        let indexPath = collectionView.indexPathForItem(at: visiblePoint) ?? centeredVisibleIndexPath()
+        guard let indexPath = indexPath else {
+            AppLog.ui.warning("Home play visible center missing indexPath point=\(String(describing: visiblePoint)), visibleCount=\(self.collectionView.visibleCells.count)")
+            return false
+        }
+
+        let player = viewModel.currentPlayer
+        AppLog.ui.info("Home play visible center index=\(indexPath.item), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath)), playerState=\(String(describing: player.state)), playerURL=\(String(describing: player.currentURL?.absoluteString))")
+        if viewModel.currentPlayingIndexPath == indexPath, player.state == .playing {
+            return true
+        }
+        return playVideo(at: indexPath)
+    }
+
+    private func centeredVisibleIndexPath() -> IndexPath? {
+        let center = CGPoint(
+            x: collectionView.contentOffset.x + collectionView.bounds.midX,
+            y: collectionView.contentOffset.y + collectionView.bounds.midY
+        )
+        return collectionView.indexPathsForVisibleItems.min { lhs, rhs in
+            guard let lhsAttributes = collectionView.layoutAttributesForItem(at: lhs),
+                  let rhsAttributes = collectionView.layoutAttributesForItem(at: rhs) else {
+                return lhs.item < rhs.item
+            }
+            let lhsDistance = abs(lhsAttributes.center.y - center.y)
+            let rhsDistance = abs(rhsAttributes.center.y - center.y)
+            return lhsDistance < rhsDistance
         }
     }
 
     func collectionView(_ collectionView: UICollectionView, didEndDisplaying cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
-        if currentPlayingIndexPath == indexPath {
-            let current = DYPlayerManager.shared.player.currentTime
-            viewModel.updateResumeTime(for: indexPath.item, time: current)
-            // 仅暂停，不完全销毁，等待可能的复用或由 managePreloadPlayers 清理
-            DYPlayerManager.shared.player.pause()
-            currentPlayingIndexPath = nil
-        }
-    }
-}
-
-// MARK: - DYVideoPlayerDelegate
-extension HomeViewController: DYVideoPlayerDelegate {
-    func player(_ player: DYVideoPlayer, didChangeState state: DYPlayerState) {
-        // 仅响应当前播放器的状态回调，忽略预加载播放器的回调
-        if player != DYPlayerManager.shared.player { return }
-        
-        guard let indexPath = currentPlayingIndexPath,
-              let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
-        cell.controlView.updateCenterBtnState(state)
-    }
-    
-    func player(_ player: DYVideoPlayer, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double) {
-        if player != DYPlayerManager.shared.player { return }
-        
-        guard let indexPath = currentPlayingIndexPath,
-              let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
-        
-        cell.controlView.updateProgress(currentTime: currentTime, totalTime: totalTime)
-    }
-    
-    func player(_ player: DYVideoPlayer, didFailWithError error: Error?) {
-        if player != DYPlayerManager.shared.player { return }
-        
-        guard let indexPath = currentPlayingIndexPath else { return }
-        let video = viewModel.videos[indexPath.item]
-        
-        // 使用 PlaybackRetryHandler 决定是否重试以及重试的 URL
-        if let currentURL = player.currentURL,
-           let retryURL = retryHandler.shouldRetry(for: error, currentURL: currentURL, originalURL: video.videoURL) {
-            
-            print("[HomeViewController] Retrying with URL: \(retryURL)")
-            // 重新播放
-            playVideo(at: indexPath)
-            
-        } else {
-            print("[HomeViewController] Player error: \(String(describing: error)). No retry strategy matched.")
-        }
+        viewModel.didEndDisplaying(at: indexPath)
     }
 }
 
 // MARK: - DYPlayerControlViewDelegate
+
 extension HomeViewController: DYPlayerControlViewDelegate {
-    
+
     func controlViewDidBeginDragging(_ controlView: DYPlayerControlView) {
-        // 拖拽开始，暂停播放以避免冲突
-        DYPlayerManager.shared.player.pause()
+        viewModel.isDraggingProgress = true
+        viewModel.pauseCurrent()
     }
 
     func controlView(_ controlView: DYPlayerControlView, didSeekTo time: Double, isPrecise: Bool) {
-        let player = DYPlayerManager.shared.player
-        // 执行 Seek
-        player.seek(to: time, isPrecise: isPrecise) { finished in
-            // 只有在精确 Seek (拖拽结束) 且 Seek 成功后才恢复播放
-            if isPrecise && finished {
-                player.resume()
-            }
-        }
-    }
-    
-    func controlViewDidTapPlayPause(_ controlView: DYPlayerControlView) {
-        let player = DYPlayerManager.shared.player
-        if player.state == .playing {
-            player.pause()
-        } else {
-            player.resume()
+        viewModel.seekCurrent(to: time, isPrecise: isPrecise) { [weak self] finished in
+            guard let self = self, isPrecise && finished else { return }
+            self.viewModel.resumeCurrent()
         }
     }
 
+    func controlViewDidTapPlayPause(_ controlView: DYPlayerControlView) {
+        viewModel.togglePlayPause()
+    }
+
     func controlViewDidTapFullscreen(_ controlView: DYPlayerControlView) {
-        guard let indexPath = currentPlayingIndexPath else { return }
+        guard let indexPath = viewModel.currentPlayingIndexPath else { return }
         presentFullscreen(for: indexPath)
     }
-    
+
     func controlViewDidBeginFastPlay(_ controlView: DYPlayerControlView) {
-        let player = DYPlayerManager.shared.player
-        if player.state != .playing {
-            player.resume()
-        }
-        player.setPlaybackRate(2.0)
+        let player = viewModel.currentPlayer
+        if player.state != .playing { player.resume() }
+        viewModel.setCurrentPlaybackRate(2.0)
     }
-    
+
     func controlViewDidEndFastPlay(_ controlView: DYPlayerControlView) {
-        let player = DYPlayerManager.shared.player
-        player.setPlaybackRate(1.0)
+        viewModel.setCurrentPlaybackRate(1.0)
     }
 }
 
 // MARK: - UIGestureRecognizerDelegate
+
 extension HomeViewController: UIGestureRecognizerDelegate {
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        // 只有当导航栈中控制器数量大于1时，才允许手势，防止在根控制器卡死
         return (navigationController?.viewControllers.count ?? 0) > 1
     }
 }

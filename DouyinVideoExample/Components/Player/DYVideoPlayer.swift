@@ -1,6 +1,7 @@
 import UIKit
 import AVFoundation
 import SnapKit
+import os.log
 
 /// 基于 AVPlayer 封装的短视频播放器组件
 /// 负责：
@@ -12,9 +13,19 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     
     // MARK: - Public Properties
     
-    /// 播放器回调代理
-    /// 用于接收状态变化、进度、缓冲、错误等事件
-    public weak var delegate: DYVideoPlayerDelegate?
+    /// 播放器回调代理（向后兼容，设置时自动同步到 multicastDelegate）
+    /// 新代码建议直接使用 multicastDelegate.add() 订阅
+    public weak var delegate: DYVideoPlayerDelegate? {
+        didSet {
+            if let delegate = delegate {
+                multicastDelegate.add(delegate)
+            }
+        }
+    }
+
+    /// 多播委托中心，允许多个订阅者同时接收播放器事件
+    /// 订阅者以弱引用持有，不会造成循环引用
+    public let multicastDelegate = DYVideoPlayerMulticastDelegate()
     
     /// 播放器当前状态（只读）
     /// 所有状态变更必须通过内部 updateState 方法触发
@@ -30,6 +41,27 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 当前播放的原始视频地址（可选，仅作记录，用于外部比对）
     public private(set) var originalURL: URL?
     
+    /// 判断当前播放器是否正在播放指定 URL 的视频
+    /// 优先匹配 originalURL（缓存代理场景），其次匹配 currentURL
+    public func isPlaying(url: URL) -> Bool {
+        if let originalURL = originalURL {
+            return originalURL == url
+        } else if let currentURL = currentURL {
+            return currentURL == url
+        }
+        return false
+    }
+    
+    /// 播放器是否已预加载就绪（首帧已渲染、暂停中、等待 attach 到容器视图）
+    /// 用于 PlayerCoordinator 判断是否可以执行无缝切换
+    public var isPreloadedAndReady: Bool {
+        return currentURL != nil
+            && player != nil
+            && state == .paused
+            && containerView == nil
+            && playerItem?.status == .readyToPlay
+    }
+    
     /// 是否静音
     public var isMuted: Bool = false {
         didSet {
@@ -40,6 +72,9 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     
     /// 是否循环播放，默认 true，适合抖音风格短视频
     public var isLooping: Bool = true // 默认开启循环播放，符合抖音风格
+    
+    /// 前向缓冲时长占视频总时长的比例（0~1）。在 `AVPlayerItem` 就绪且能读到有效 `duration` 时映射为 `preferredForwardBufferDuration`；`nil` 表示使用系统默认策略。
+    public var preferredForwardBufferFraction: Double?
     
     /// 播放音量（0.0 ~ 1.0）
     public var volume: Float = 1.0 {
@@ -112,16 +147,25 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 当前播放项 KVO (用于 Looper 切换 Item 时更新)
     private var currentItemObserver: NSKeyValueObservation?
     
+    /// 首帧渲染标记：prepare 模式下 play→pause 渲染首帧时为 true，
+    /// 期间抑制状态回调避免外部误判为正在播放
+    private var isRenderingFirstFrame: Bool = false
+    
+    /// 首帧渲染前的原始静音状态，渲染完成后恢复
+    private var wasMutedBeforeFirstFrame: Bool = false
+
+    /// 准备阶段兜底超时，用于暴露 AVAsset/AVPlayerItem 长时间无状态回调的问题
+    private var preparationTimeoutWorkItem: DispatchWorkItem?
+    
     // MARK: - Initialization
     
     public override init() {
         super.init()
-        setupAudioSession()
     }
     
     deinit {
         cleanupPlayerResources(resetState: false)
-        print("DYVideoPlayer deinit")
+        AppLog.player.debug("DYVideoPlayer deinit")
     }
     
     // MARK: - Public Methods
@@ -132,76 +176,37 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     ///   - originalURL: 原始 URL
     public func prepare(url: URL, originalURL: URL? = nil) {
         assertMainThread()
-        // 如果已经在播放同一个 URL，则忽略
         if currentURL == url { return }
-        
-        // 清理旧资源但不重置 UI（因为可能还未 attach 到 view）
+        AppLog.player.info("DYVideoPlayer prepare url=\(url.absoluteString), original=\(String(describing: originalURL?.absoluteString)), state=\(String(describing: self.state))")
+
         cleanupPlayerResources(resetState: true)
-        
+
         self.currentURL = url
         self.originalURL = originalURL
         self.updateState(.preparing)
-        
-        DispatchQueue.global(qos: .userInitiated).async {
-            let asset = AVURLAsset(url: url)
-            let keys = ["playable"]
-            asset.loadValuesAsynchronously(forKeys: keys) { [weak self] in
-                guard let self = self else { return }
-                var error: NSError?
-                let status = asset.statusOfValue(forKey: "playable", error: &error)
-                if status == .loaded && asset.isPlayable {
-                    let initialItem = AVPlayerItem(asset: asset)
-                    DispatchQueue.main.async {
-                        if self.isLooping {
-                            let queuePlayer = AVQueuePlayer(playerItem: initialItem)
-                            self.playerLooper = AVPlayerLooper(player: queuePlayer, templateItem: initialItem)
-                            self.player = queuePlayer
-                        } else {
-                            self.player = AVPlayer(playerItem: initialItem)
-                        }
-                        self.playerItem = initialItem
-                        guard let player = self.player else { return }
-                        player.isMuted = self.isMuted
-                        player.volume = self.volume
-                        if #available(iOS 10.0, *) {
-                            player.automaticallyWaitsToMinimizeStalling = false
-                        }
-                        // 预加载模式下暂不暂停，保持 pause 状态等待指令
-                        player.pause()
-                        
-                        // 绑定 Player 到 View，但 View 可能还未显示
-                        self.playerView.player = player
-                        self.addPlayerObservers()
-                    }
-                } else {
-                    DispatchQueue.main.async {
-                        let message = error?.localizedDescription ?? "Asset not playable"
-                        self.updateState(.error(message))
-                        self.delegate?.player(self, didFailWithError: error)
-                    }
-                }
-            }
-        }
+
+        loadAssetAndCreatePlayer(url: url, autoPlay: false)
     }
     
     /// 重置播放器状态以便复用
     public func reset() {
         assertMainThread()
+        preferredForwardBufferFraction = nil
         cleanupPlayerResources(resetState: true)
         containerView = nil
         delegate = nil
+        multicastDelegate.removeAll()
         playerView.isHidden = true
     }
 
     public func play(url: URL, originalURL: URL? = nil, in view: UIView, seekTo: TimeInterval? = nil) {
         assertMainThread()
-        
-        // 检查是否是同一个视频，且播放器可用
+        AppLog.player.info("DYVideoPlayer play called url=\(url.absoluteString), original=\(String(describing: originalURL?.absoluteString)), seek=\(String(describing: seekTo)), currentURL=\(String(describing: self.currentURL?.absoluteString)), state=\(String(describing: self.state)), hasPlayer=\(self.player != nil), viewBounds=\(String(describing: view.bounds))")
+
         if currentURL == url, player != nil {
-            // 只是切换容器或恢复播放
+            AppLog.player.info("DYVideoPlayer play same URL, update container and resume")
             updateContainer(view)
-            
-            // 如果有 seek 需求
+
             if let time = seekTo {
                 seek(to: time) { [weak self] _ in
                     self?.resume()
@@ -209,77 +214,40 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
             } else {
                 resume()
             }
-            
-            // 确保显示
+
             playerView.isHidden = false
             return
         }
-        
+
         let previousContainer = containerView
         stop()
         self.currentURL = url
         self.originalURL = originalURL
         self.pendingSeekTime = seekTo
-        
-        DispatchQueue.main.async {
-            view.layoutIfNeeded()
-            self.playerView.removeFromSuperview()
-            self.playerView.player = nil
-            self.playerView.playerLayer.contents = nil
-            view.addSubview(self.playerView)
-            self.playerView.snp.remakeConstraints { make in
-                make.edges.equalToSuperview()
-            }
-            self.playerView.isHidden = false
-            self.updateState(.preparing)
-            self.containerView = view
-            if previousContainer !== view {
-                self.delegate?.player(self, didChangeContainerFrom: previousContainer, to: view)
-            }
+
+        view.layoutIfNeeded()
+        playerView.removeFromSuperview()
+        playerView.player = nil
+        playerView.playerLayer.contents = nil
+        view.addSubview(playerView)
+        playerView.snp.remakeConstraints { make in
+            make.edges.equalToSuperview()
         }
-        
-        DispatchQueue.global(qos: .userInitiated).async {
-            let asset = AVURLAsset(url: url)
-            let keys = ["playable"]
-            asset.loadValuesAsynchronously(forKeys: keys) { [weak self] in
-                guard let self = self else { return }
-                var error: NSError?
-                let status = asset.statusOfValue(forKey: "playable", error: &error)
-                if status == .loaded && asset.isPlayable {
-                    let initialItem = AVPlayerItem(asset: asset)
-                    DispatchQueue.main.async {
-                        if self.isLooping {
-                            let queuePlayer = AVQueuePlayer(playerItem: initialItem)
-                            self.playerLooper = AVPlayerLooper(player: queuePlayer, templateItem: initialItem)
-                            self.player = queuePlayer
-                        } else {
-                            self.player = AVPlayer(playerItem: initialItem)
-                        }
-                        self.playerItem = initialItem
-                        guard let player = self.player else { return }
-                        player.isMuted = self.isMuted
-                        player.volume = self.volume
-                        if #available(iOS 10.0, *) {
-                            player.automaticallyWaitsToMinimizeStalling = false
-                        }
-                        self.playerView.player = player
-                        self.addPlayerObservers()
-                    }
-                } else {
-                    DispatchQueue.main.async {
-                        let message = error?.localizedDescription ?? "Asset not playable"
-                        self.updateState(.error(message))
-                        self.delegate?.player(self, didFailWithError: error)
-                    }
-                }
-            }
+        playerView.isHidden = false
+        updateState(.preparing)
+        containerView = view
+        if previousContainer !== view {
+            multicastDelegate.player(self, didChangeContainerFrom: previousContainer, to: view)
         }
+
+        loadAssetAndCreatePlayer(url: url, autoPlay: true)
     }
     
     /// 恢复播放
     /// 如果当前状态是 finished，会从头开始播放
     public func resume() {
         assertMainThread()
+        AppLog.player.info("DYVideoPlayer resume state=\(String(describing: self.state)), hasPlayer=\(self.player != nil), currentURL=\(String(describing: self.currentURL?.absoluteString))")
         if state == .finished {
             seek(to: 0) { [weak self] _ in
                 if let player = self?.player {
@@ -298,6 +266,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 暂停播放（保留当前进度）
     public func pause() {
         assertMainThread()
+        AppLog.player.info("DYVideoPlayer pause state=\(String(describing: self.state)), currentURL=\(String(describing: self.currentURL?.absoluteString))")
         player?.pause()
         updateState(.paused)
     }
@@ -376,7 +345,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         
         containerView = view
         if previousContainer !== view {
-            delegate?.player(self, didChangeContainerFrom: previousContainer, to: view)
+            multicastDelegate.player(self, didChangeContainerFrom: previousContainer, to: view)
         }
     }
     
@@ -400,23 +369,98 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         videoGravity = gravity
     }
 
-    public func updatePlayerFrame(_ frame: CGRect) {
-        assertMainThread()
-        // 使用 PlayerView + SnapKit 后，通常不再手动设置 frame
-        // 如果确实需要更新 frame，建议更新约束
-        // 这里为了兼容接口，如果 playerView 没有使用约束（autoresizing），可以直接设置 frame
-        // 但我们在 play 中使用了 SnapKit，所以这里应该更新约束
-        // 暂时假设外部不再调用此方法，或者此方法意图是更新约束的 offset/size
-        // 鉴于 SnapKit edges.equalToSuperview 的特性，此方法可能已废弃
-        playerView.frame = frame
+    // MARK: - Private Methods
+
+    /// 异步加载 AVAsset 并创建 AVPlayer/AVPlayerItem
+    /// 统一 `play` 和 `prepare` 的资源创建逻辑，消除重复代码
+    /// - Parameters:
+    ///   - url: 视频 URL
+    ///   - autoPlay: true 表示播放模式（play 调用），false 表示预加载模式（prepare 调用，初始暂停）
+    private func loadAssetAndCreatePlayer(url: URL, autoPlay: Bool) {
+        let requestID = UUID().uuidString
+        AppLog.player.info("DYVideoPlayer loadAsset begin id=\(requestID), url=\(url.absoluteString), autoPlay=\(autoPlay)")
+
+        let asset = AVURLAsset(url: url)
+        let initialItem = AVPlayerItem(asset: asset)
+
+        if isLooping {
+            let queuePlayer = AVQueuePlayer()
+            playerLooper = AVPlayerLooper(player: queuePlayer, templateItem: initialItem)
+            player = queuePlayer
+            playerItem = queuePlayer.currentItem ?? initialItem
+        } else {
+            player = AVPlayer(playerItem: initialItem)
+            playerItem = initialItem
+        }
+
+        guard let player = player else { return }
+        player.isMuted = isMuted
+        player.volume = volume
+        if #available(iOS 10.0, *) {
+            player.automaticallyWaitsToMinimizeStalling = false
+        }
+        if !autoPlay {
+            player.pause()
+        }
+        playerView.player = player
+        addPlayerObservers()
+        schedulePreparationTimeout(for: url, requestID: requestID)
+        AppLog.player.info("DYVideoPlayer player created id=\(requestID), itemStatus=\(String(describing: self.playerItem?.status.rawValue)), timeControlStatus=\(player.timeControlStatus.rawValue), autoPlay=\(autoPlay)")
+
+        asset.loadValuesAsynchronously(forKeys: ["tracks"]) { [weak self] in
+            var error: NSError?
+            let tracksStatus = asset.statusOfValue(forKey: "tracks", error: &error)
+            guard tracksStatus == .loaded,
+                  let track = asset.tracks(withMediaType: .video).first else {
+                let message = error?.localizedDescription ?? "tracks not loaded"
+                AppLog.player.warning("DYVideoPlayer tracks load skipped id=\(requestID), status=\(tracksStatus.rawValue), error=\(message)")
+                return
+            }
+
+            let size = track.naturalSize.applying(track.preferredTransform)
+            let videoSize = CGSize(width: abs(size.width), height: abs(size.height))
+            DispatchQueue.main.async {
+                guard let self = self, self.currentURL == url else { return }
+                self.multicastDelegate.player(self, didUpdateVideoSize: videoSize)
+            }
+        }
+    }
+
+    private func schedulePreparationTimeout(for url: URL, requestID: String) {
+        preparationTimeoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self,
+                  self.currentURL == url,
+                  self.state == .preparing else { return }
+            let itemStatus = self.playerItem?.status.rawValue ?? -1
+            let playerStatus: Int
+            if #available(iOS 10.0, *) {
+                playerStatus = self.player?.timeControlStatus.rawValue ?? -1
+            } else {
+                playerStatus = -1
+            }
+            AppLog.player.error("DYVideoPlayer preparation timeout id=\(requestID), url=\(url.absoluteString), itemStatus=\(itemStatus), timeControlStatus=\(playerStatus), error=\(String(describing: self.playerItem?.error?.localizedDescription))")
+            self.updateState(.error("Playback preparation timed out"))
+        }
+        preparationTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: workItem)
+    }
+
+    /// 断言当前在主线程调用
+    /// 仅在 Debug 构建中检查，Release 中优雅降级为日志警告
+    private func assertMainThread() {
+        assert(Thread.isMainThread, "Player method must be called on main thread")
+        if !Thread.isMainThread {
+            AppLog.player.warning("Player method called off main thread — this may cause UI issues")
+        }
     }
     
-    // MARK: - Private Methods
-    
-    /// 断言当前在主线程调用（仅在 Debug 下生效）
-    /// 用于约束外部所有公开 API 必须在主线程使用
-    private func assertMainThread() {
-        assert(Thread.isMainThread, "DYVideoPlayer public APIs must be called on main thread")
+    private func applyPreferredForwardBufferIfNeeded(for item: AVPlayerItem) {
+        guard let fraction = preferredForwardBufferFraction else { return }
+        let total = item.duration.seconds
+        guard total.isFinite, total > 0 else { return }
+        let clamped = min(max(fraction, 0), 1)
+        item.preferredForwardBufferDuration = max(1, total * clamped)
     }
     
     /// 更新播放器状态，并在状态变化时通过 delegate 通知外部
@@ -425,8 +469,9 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         let work = { [weak self] in
             guard let self = self else { return }
             guard self.state != newState else { return }
+            AppLog.player.info("DYVideoPlayer state \(String(describing: self.state)) -> \(String(describing: newState)), currentURL=\(String(describing: self.currentURL?.absoluteString))")
             self.state = newState
-            self.delegate?.player(self, didChangeState: newState)
+            self.multicastDelegate.player(self, didChangeState: newState)
         }
         if Thread.isMainThread {
             work()
@@ -440,7 +485,12 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     private func cleanupPlayerResources(resetState: Bool) {
         // 先移除所有监听
         removePlayerObservers()
-        // playerItem = nil 会触发 didSet 移除 Item 的监听
+        if isRenderingFirstFrame {
+            player?.isMuted = wasMutedBeforeFirstFrame
+        }
+        preparationTimeoutWorkItem?.cancel()
+        preparationTimeoutWorkItem = nil
+        isRenderingFirstFrame = false
         playerItem = nil
         
         playerLooper?.disableLooping()
@@ -457,17 +507,6 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         originalURL = nil
         if resetState {
             updateState(.idle)
-        }
-    }
-    
-    /// 配置音频会话，保证在静音模式下也能播放
-    private func setupAudioSession() {
-        // 允许在静音模式下播放声音
-        do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
-            try AVAudioSession.sharedInstance().setActive(true)
-        } catch {
-            print("AudioSession setup failed: \(error)")
         }
     }
     
@@ -490,7 +529,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         guard let player = player else { return }
         
         // 1. 监听 currentItem 变化 (处理 Looper 切换 Item)
-        currentItemObserver = player.observe(\.currentItem, options: [.new]) { [weak self] player, _ in
+        currentItemObserver = player.observe(\.currentItem, options: [.initial, .new]) { [weak self] player, _ in
             guard let self = self else { return }
             // 更新 playerItem 属性，这会触发 didSet 并自动重新绑定 Item 级别的 Observer
             self.playerItem = player.currentItem
@@ -500,6 +539,10 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         if #available(iOS 10.0, *) {
             timeControlStatusObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
                 self?.handleTimeControlStatus(player.timeControlStatus)
+            }
+            // 防御性检查：如果 timeControlStatus 在添加观察者前已变更（缓存命中快速就绪场景）
+            if player.timeControlStatus == .playing {
+                handleTimeControlStatus(.playing)
             }
         }
         
@@ -511,11 +554,16 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     }
     
     /// 为具体的 PlayerItem 添加监听 (status, loadedTimeRanges, DidPlayToEndTime)
+    /// 添加观察者后立即检查 status 是否已就绪：
+    /// 当 AVPlayerItem 通过 KTVHTTPCache 代理加载时，asset 数据已在本地，
+    /// item.status 可能在 addPlayerItemObservers 调用前就已变为 .readyToPlay，
+    /// 此时 KVO (.new) 不会触发，导致 handleStatusChange 永远不被调用、播放器无法自动播放
     private func addPlayerItemObservers(for item: AVPlayerItem?) {
         guard let item = item else { return }
+        AppLog.player.info("DYVideoPlayer add item observers status=\(item.status.rawValue), currentURL=\(String(describing: self.currentURL?.absoluteString))")
         
         // 1. 监听 status (准备状态)
-        statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+        statusObserver = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             self?.handleStatusChange(item.status)
         }
         
@@ -560,9 +608,15 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 处理 AVPlayerItem.status 变化
     /// - Parameter status: 最新的播放项状态
     private func handleStatusChange(_ status: AVPlayerItem.Status) {
+        AppLog.player.info("DYVideoPlayer item status=\(status.rawValue), state=\(String(describing: self.state)), hasContainer=\(self.containerView != nil), pendingSeek=\(String(describing: self.pendingSeekTime)), currentURL=\(String(describing: self.currentURL?.absoluteString))")
         switch status {
         case .readyToPlay:
+            preparationTimeoutWorkItem?.cancel()
+            preparationTimeoutWorkItem = nil
             // 准备好播放了
+            if let item = playerItem {
+                applyPreferredForwardBufferIfNeeded(for: item)
+            }
             
             // 只有当不是在“仅预加载”模式（即 containerView != nil 或明确要求播放）时，才触发自动播放逻辑
             // 如果是 prepare() 触发的 readyToPlay，且此时还没有 attach 到 view，我们只做状态标记，不调 play()
@@ -582,55 +636,35 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
                 } else {
                     // 如果处于暂停状态且不是预加载（有 container），则恢复播放
                     if state != .paused {
+                         AppLog.player.info("DYVideoPlayer readyToPlay -> play")
                          player?.play()
                          player?.rate = playbackRate
+                    } else {
+                         AppLog.player.warning("DYVideoPlayer readyToPlay has container but state is paused; skip auto play")
                     }
                     playerView.isHidden = false
                 }
             } else {
-                 // 预加载完成，保持暂停，但在 play() 被调用并 attach view 后能立即显示
-                 // 可以考虑在这里预先解码第一帧（seek to 0）
-                 // 抖音优化技巧：预先 seek 到 0 并 render 一帧
-                 if let player = player, player.currentItem?.currentTime() == .zero {
-                     // 这一步对于首帧秒开很重要，强制渲染管线准备好数据
-                     player.preroll(atRate: 1.0) { _ in }
-                 }
-            }
-            
-            // 获取视频尺寸 - 异步加载 tracks 防止阻塞主线程
-            // Fix: Main thread blocked by synchronous property query on not-yet-loaded property (NaturalSize)
-            let asset = playerItem?.asset
-            let keys = ["tracks"]
-            asset?.loadValuesAsynchronously(forKeys: keys) { [weak self] in
-                guard let self = self, let asset = asset else { return }
-                
-                var error: NSError? = nil
-                let status = asset.statusOfValue(forKey: "tracks", error: &error)
-                
-                if status == .loaded {
-                    // Force processing to background if not already
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        if let track = asset.tracks(withMediaType: .video).first {
-                            // These properties can still block if not fully ready, so we access them in background
-                            let size = track.naturalSize.applying(track.preferredTransform)
-                            let videoSize = CGSize(width: abs(size.width), height: abs(size.height))
-                            DispatchQueue.main.async {
-                                self.delegate?.player(self, didUpdateVideoSize: videoSize)
-                            }
-                        }
-                    }
-                } else {
-                    print("Failed to load tracks: \(String(describing: error))")
-                }
+                AppLog.player.info("DYVideoPlayer preload ready -> paused")
+                player?.pause()
+                player?.rate = 0
+                isRenderingFirstFrame = false
+                updateState(.paused)
             }
             
         case .failed:
+            preparationTimeoutWorkItem?.cancel()
+            preparationTimeoutWorkItem = nil
+            if isRenderingFirstFrame {
+                player?.isMuted = wasMutedBeforeFirstFrame
+            }
+            isRenderingFirstFrame = false
             let errorMsg = playerItem?.error?.localizedDescription ?? "Unknown error"
             // 移除内部自动重试逻辑，直接上报错误
             // 重试策略由外部（如 PlaybackRetryHandler）接管
             updateState(.error(errorMsg))
             DispatchQueue.main.async {
-                self.delegate?.player(self, didFailWithError: self.playerItem?.error)
+                self.multicastDelegate.player(self, didFailWithError: self.playerItem?.error)
             }
             
         case .unknown:
@@ -643,19 +677,36 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 处理 AVPlayer.timeControlStatus 变化（播放、暂停、缓冲）
     /// - Parameter status: 播放控制状态
     private func handleTimeControlStatus(_ status: AVPlayer.TimeControlStatus) {
+        AppLog.player.info("DYVideoPlayer timeControlStatus=\(status.rawValue), state=\(String(describing: self.state)), renderingFirstFrame=\(self.isRenderingFirstFrame), currentURL=\(String(describing: self.currentURL?.absoluteString))")
         switch status {
         case .paused:
-            // 只有不是播放完成状态时，才切换为 paused
+            if isRenderingFirstFrame { return }
             if state != .finished && state != .idle {
                 updateState(.paused)
             }
         case .waitingToPlayAtSpecifiedRate:
-            // 缓冲中
-            if state != .idle && state != .preparing {
+            if isRenderingFirstFrame { return }
+            if state != .idle {
                 updateState(.buffering)
             }
         case .playing:
-            updateState(.playing)
+            guard containerView != nil else {
+                AppLog.player.warning("DYVideoPlayer preload player entered playing without container, force pause")
+                player?.pause()
+                player?.rate = 0
+                player?.isMuted = wasMutedBeforeFirstFrame
+                isRenderingFirstFrame = false
+                updateState(.paused)
+                return
+            }
+            if isRenderingFirstFrame {
+                player?.pause()
+                player?.isMuted = wasMutedBeforeFirstFrame
+                isRenderingFirstFrame = false
+                updateState(.paused)
+            } else {
+                updateState(.playing)
+            }
         @unknown default:
             break
         }
@@ -673,7 +724,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         if totalDuration > 0 {
             let progress = bufferTime / totalDuration
             DispatchQueue.main.async {
-                self.delegate?.player(self, didUpdateBuffer: progress)
+                self.multicastDelegate.player(self, didUpdateBuffer: progress)
             }
         }
     }
@@ -682,12 +733,13 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// - Parameter time: 当前播放时间（CMTime）
     private func handleTimeUpdate(_ time: CMTime) {
         guard let item = playerItem else { return }
+        if isRenderingFirstFrame { return }
         let current = time.seconds
         let total = item.duration.seconds
         
         if total > 0 {
             let progress = current / total
-            self.delegate?.player(self, didUpdateProgress: progress, currentTime: current, totalTime: total)
+            self.multicastDelegate.player(self, didUpdateProgress: progress, currentTime: current, totalTime: total)
         }
     }
     
@@ -704,13 +756,13 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
              // 可以在这里做播放次数统计等
              // 注意：AVPlayerLooper 可能会预加载下一个 Item，导致通知时机可能略有不同，但通常是准确的
              DispatchQueue.main.async {
-                 self.delegate?.playerDidFinishPlaying(self)
+                 self.multicastDelegate.playerDidFinishPlaying(self)
              }
         } else {
             // 非 Looper 模式，正常结束
             updateState(.finished)
             DispatchQueue.main.async {
-                self.delegate?.playerDidFinishPlaying(self)
+                self.multicastDelegate.playerDidFinishPlaying(self)
             }
         }
     }
