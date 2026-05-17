@@ -34,6 +34,64 @@ public enum DYVideoGravity {
     case resize
 }
 
+/// 播放器配置项。
+/// 用配置对象集中管理播放速度、画面填充、音量、循环和缓冲策略，避免不同播放器实例之间配置不一致。
+public struct DYVideoPlayerConfiguration: Equatable {
+    /// 当前播放速度（1.0 为正常速度）
+    public var playbackRate: Float
+    /// 当前视频画面填充策略
+    public var videoGravity: DYVideoGravity
+    /// 是否静音
+    public var isMuted: Bool
+    /// 播放音量（0.0 ~ 1.0）
+    public var volume: Float
+    /// 是否循环播放
+    public var isLooping: Bool
+    /// 前向缓冲占整条视频时长的比例（0~1），nil 表示使用系统默认策略
+    public var preferredForwardBufferFraction: Double?
+
+    public init(
+        playbackRate: Float = 1.0,
+        videoGravity: DYVideoGravity = .aspectFit,
+        isMuted: Bool = false,
+        volume: Float = 1.0,
+        isLooping: Bool = true,
+        preferredForwardBufferFraction: Double? = nil
+    ) {
+        self.playbackRate = Self.clampPlaybackRate(playbackRate)
+        self.videoGravity = videoGravity
+        self.isMuted = isMuted
+        self.volume = Self.clampVolume(volume)
+        self.isLooping = isLooping
+        self.preferredForwardBufferFraction = preferredForwardBufferFraction.map(Self.clampFraction)
+    }
+
+    public static let `default` = DYVideoPlayerConfiguration()
+
+    func normalized() -> DYVideoPlayerConfiguration {
+        DYVideoPlayerConfiguration(
+            playbackRate: playbackRate,
+            videoGravity: videoGravity,
+            isMuted: isMuted,
+            volume: volume,
+            isLooping: isLooping,
+            preferredForwardBufferFraction: preferredForwardBufferFraction
+        )
+    }
+
+    private static func clampPlaybackRate(_ value: Float) -> Float {
+        min(max(value, 0.5), 3.0)
+    }
+
+    private static func clampVolume(_ value: Float) -> Float {
+        min(max(value, 0), 1)
+    }
+
+    private static func clampFraction(_ value: Double) -> Double {
+        min(max(value, 0), 1)
+    }
+}
+
 // MARK: - Player Delegate Protocol
 /// 播放器代理协议 - 所有的回调事件
 public protocol DYVideoPlayerDelegate: AnyObject {
@@ -93,6 +151,7 @@ public protocol DYVideoPlayerInput {
     var isMuted: Bool { get set }
     var volume: Float { get set }
     var isLooping: Bool { get set }
+    var configuration: DYVideoPlayerConfiguration { get set }
     var state: DYPlayerState { get }
     var duration: Double { get }
     var currentTime: Double { get }
@@ -120,6 +179,9 @@ public protocol DYVideoPlayerInput {
     ///   - isPrecise: 是否精确跳转 (默认 true)
     ///   - completion: 完成回调
     func seek(to time: TimeInterval, isPrecise: Bool, completion: ((Bool) -> Void)?)
+
+    /// 应用播放器配置
+    func applyConfiguration(_ configuration: DYVideoPlayerConfiguration)
 }
 
 public extension DYVideoPlayerInput {

@@ -10,26 +10,42 @@ public final class DYPlaybackService {
 
     private let pool: DYPlayerPool
 
-    /// 前向缓冲占整条视频时长的比例（0~1），在 `DYVideoPlayer` 就绪后映射为 `AVPlayerItem.preferredForwardBufferDuration`。
-    public var preloadPercentage: Double {
-        get { _preloadPercentage }
-        set { _preloadPercentage = Self.clampFraction(newValue) }
+    /// 全局播放器配置。所有通过 Service 发起的播放和预加载都会先应用该配置。
+    public var configuration: DYVideoPlayerConfiguration {
+        get { _configuration }
+        set {
+            _configuration = newValue.normalized()
+            player.applyConfiguration(_configuration)
+        }
     }
 
-    private var _preloadPercentage: Double = 0.10
+    /// 前向缓冲占整条视频时长的比例（0~1），在 `DYVideoPlayer` 就绪后映射为 `AVPlayerItem.preferredForwardBufferDuration`。
+    public var preloadPercentage: Double {
+        get { _configuration.preferredForwardBufferFraction ?? 0 }
+        set {
+            var updated = _configuration
+            updated.preferredForwardBufferFraction = Self.clampFraction(newValue)
+            configuration = updated
+        }
+    }
+
+    private var _configuration = DYVideoPlayerConfiguration(preferredForwardBufferFraction: 0.10)
 
     public init(pool: DYPlayerPool) {
         self.pool = pool
-        _preloadPercentage = Self.clampFraction(_preloadPercentage)
     }
 
     public var player: DYVideoPlayer {
         pool.player
     }
 
+    public func configure(_ player: DYVideoPlayer) {
+        player.applyConfiguration(configuration)
+    }
+
     public func play(url: URL, in view: UIView, seekTo: TimeInterval? = nil) {
         let p = pool.player
-        p.preferredForwardBufferFraction = Self.clampFraction(preloadPercentage)
+        configure(p)
         AppLog.player.info("PlaybackService play direct url=\(url.absoluteString), seek=\(String(describing: seekTo)), playerState=\(String(describing: p.state))")
         p.play(url: url, in: view, seekTo: seekTo)
     }
@@ -41,14 +57,14 @@ public final class DYPlaybackService {
         use targetPlayer: DYVideoPlayer? = nil
     ) {
         let p = targetPlayer ?? player
-        p.preferredForwardBufferFraction = Self.clampFraction(preloadPercentage)
+        configure(p)
         let proxyURL = VideoCacheManager.shared.getProxyURL(for: originalURL)
         AppLog.player.info("PlaybackService playWithCache original=\(originalURL.absoluteString), resolved=\(proxyURL.absoluteString), isProxy=\(proxyURL != originalURL), seek=\(String(describing: seekTo)), playerState=\(String(describing: p.state))")
         p.play(url: proxyURL, originalURL: originalURL, in: view, seekTo: seekTo)
     }
 
     public func preload(originalURL: URL, use targetPlayer: DYVideoPlayer) {
-        targetPlayer.preferredForwardBufferFraction = Self.clampFraction(preloadPercentage)
+        configure(targetPlayer)
         let proxyURL = VideoCacheManager.shared.getProxyURL(for: originalURL)
         AppLog.player.info("PlaybackService preload original=\(originalURL.absoluteString), resolved=\(proxyURL.absoluteString), isProxy=\(proxyURL != originalURL), playerState=\(String(describing: targetPlayer.state))")
         targetPlayer.prepare(url: proxyURL, originalURL: originalURL)

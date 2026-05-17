@@ -65,6 +65,11 @@ public final class DYPlayerPool {
         return nil
     }
 
+    /// 将配置应用到池内所有播放器实例。
+    public func applyConfigurationToAll(_ configuration: DYVideoPlayerConfiguration) {
+        playerPool.forEach { $0.applyConfiguration(configuration) }
+    }
+
     /// 将指定播放器提升为当前主播放器；若该实例不在池中则会先**收养**入池（必要时按 LRU 腾出名额）。
     public func promoteToCurrent(_ player: DYVideoPlayer) {
         ensurePooled(player)

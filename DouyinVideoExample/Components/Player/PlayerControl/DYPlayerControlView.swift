@@ -45,6 +45,10 @@ public class DYPlayerControlView: UIView {
     private var viewState = ViewState()
 
     private var totalDuration: Double = 0
+    private let previewSeekThrottleInterval: TimeInterval = 0.08
+    private var lastPreviewSeekTime: TimeInterval = 0
+    private var pendingPreviewSeekTime: Double?
+    private var pendingPreviewSeekWorkItem: DispatchWorkItem?
     /// 延迟隐藏错误覆盖层的任务，用于避免频繁闪烁
     private var errorOverlayPendingWorkItem: DispatchWorkItem?
     private var errorOverlayShowWorkItem: DispatchWorkItem?
@@ -102,6 +106,7 @@ public class DYPlayerControlView: UIView {
         bar.didBeginDragging = { [weak self] in
             guard let self = self else { return }
             self.isDragging = true
+            self.resetPreviewSeekThrottle()
             self.showFloatingTime(true)
             self.delegate?.controlViewDidBeginDragging(self)
         }
@@ -110,8 +115,7 @@ public class DYPlayerControlView: UIView {
             guard let self = self else { return }
             let time = Double(progress) * self.totalDuration
             self.updateFloatingTime(currentTime: time, totalTime: self.totalDuration)
-            // 触发非精确 Seek (实时预览)
-            self.delegate?.controlView(self, didSeekTo: time, isPrecise: false)
+            self.requestPreviewSeek(to: time)
         }
         
         bar.didEndDragging = { [weak self] progress in
@@ -119,7 +123,7 @@ public class DYPlayerControlView: UIView {
             self.isDragging = false
             self.showFloatingTime(false)
             let time = Double(progress) * self.totalDuration
-            // 触发精确 Seek (最终定位)
+            self.cancelPendingPreviewSeek()
             self.delegate?.controlView(self, didSeekTo: time, isPrecise: true)
         }
         
@@ -265,6 +269,7 @@ public class DYPlayerControlView: UIView {
         totalDuration = 0
         isDragging = false
         isFastPlaying = false
+        resetPreviewSeekThrottle()
     }
 
     /// 更新加载状态，控制加载动画与错误覆盖层
@@ -339,6 +344,45 @@ public class DYPlayerControlView: UIView {
         }
     }
 
+    private func requestPreviewSeek(to time: Double) {
+        let now = CACurrentMediaTime()
+        let elapsed = now - lastPreviewSeekTime
+
+        if elapsed >= previewSeekThrottleInterval {
+            cancelPendingPreviewSeek()
+            lastPreviewSeekTime = now
+            delegate?.controlView(self, didSeekTo: time, isPrecise: false)
+            return
+        }
+
+        pendingPreviewSeekTime = time
+        guard pendingPreviewSeekWorkItem == nil else { return }
+
+        let delay = previewSeekThrottleInterval - elapsed
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self,
+                  let pendingTime = self.pendingPreviewSeekTime,
+                  self.isDragging else { return }
+            self.pendingPreviewSeekWorkItem = nil
+            self.pendingPreviewSeekTime = nil
+            self.lastPreviewSeekTime = CACurrentMediaTime()
+            self.delegate?.controlView(self, didSeekTo: pendingTime, isPrecise: false)
+        }
+        pendingPreviewSeekWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func resetPreviewSeekThrottle() {
+        cancelPendingPreviewSeek()
+        lastPreviewSeekTime = 0
+    }
+
+    private func cancelPendingPreviewSeek() {
+        pendingPreviewSeekWorkItem?.cancel()
+        pendingPreviewSeekWorkItem = nil
+        pendingPreviewSeekTime = nil
+    }
+
     /// 根据新旧 ViewState 渲染 UI，避免不必要的刷新
     /// - Parameters:
     ///   - old: 旧状态
@@ -368,22 +412,20 @@ public class DYPlayerControlView: UIView {
                 fullscreenButton.isHidden = true
                 scheduleShowErrorOverlay()
             case .playing:
-                centerPlayIcon.image = UIImage(systemName: "pause.fill")
                 scheduleHideErrorOverlay()
-                UIView.animate(withDuration: 0.2) {
-                    self.centerPlayIcon.alpha = 0
-                } completion: { _ in
-                    self.centerPlayIcon.isHidden = true
-                    self.centerPlayIcon.alpha = 1
-                }
+                centerPlayIcon.layer.removeAllAnimations()
+                centerPlayIcon.isHidden = true
+                centerPlayIcon.alpha = 1
             case .idle, .preparing, .finished, .buffering:
                 scheduleHideErrorOverlay()
+                centerPlayIcon.layer.removeAllAnimations()
                 centerPlayIcon.isHidden = true
-                self.centerPlayIcon.alpha = 0
+                centerPlayIcon.alpha = 1
             case .paused:
                 scheduleHideErrorOverlay()
                 centerPlayIcon.image = UIImage(systemName: "play.fill")
                 // 恢复简洁逻辑：暂停时直接显示图标（延迟/闪烁问题已由 HomeVC 层面解决）
+                centerPlayIcon.layer.removeAllAnimations()
                 self.centerPlayIcon.alpha = 0
                 self.centerPlayIcon.isHidden = false
                 UIView.animate(withDuration: 0.2) {

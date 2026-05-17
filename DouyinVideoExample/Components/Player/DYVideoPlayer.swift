@@ -61,6 +61,11 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
             && containerView == nil
             && playerItem?.status == .readyToPlay
     }
+
+    /// 当前播放器是否已有可显示的视频画面，用于列表切换时避免封面层重新盖上造成闪烁。
+    public var isReadyForDisplay: Bool {
+        return player != nil && playerItem?.status == .readyToPlay
+    }
     
     /// 是否静音
     public var isMuted: Bool = false {
@@ -98,6 +103,23 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         didSet {
             assertMainThread()
             updatePlayerLayerGravity()
+        }
+    }
+
+    /// 当前播放器配置。设置该属性会立即应用到播放器实例。
+    public var configuration: DYVideoPlayerConfiguration {
+        get {
+            DYVideoPlayerConfiguration(
+                playbackRate: playbackRate,
+                videoGravity: videoGravity,
+                isMuted: isMuted,
+                volume: volume,
+                isLooping: isLooping,
+                preferredForwardBufferFraction: preferredForwardBufferFraction
+            )
+        }
+        set {
+            applyConfiguration(newValue)
         }
     }
     
@@ -156,6 +178,9 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
 
     /// 准备阶段兜底超时，用于暴露 AVAsset/AVPlayerItem 长时间无状态回调的问题
     private var preparationTimeoutWorkItem: DispatchWorkItem?
+
+    /// 正常播放态的进度回调间隔；拖拽进度条时由手势事件即时更新，不依赖此周期 observer。
+    private let progressUpdateInterval: TimeInterval = 0.25
     
     // MARK: - Initialization
     
@@ -369,6 +394,22 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         videoGravity = gravity
     }
 
+    /// 应用播放器配置。
+    /// 对正在播放的播放器，倍速、静音、音量和填充模式会立即生效；循环策略会在下一次创建播放项时生效。
+    public func applyConfiguration(_ configuration: DYVideoPlayerConfiguration) {
+        assertMainThread()
+        let normalized = configuration.normalized()
+        playbackRate = normalized.playbackRate
+        videoGravity = normalized.videoGravity
+        isMuted = normalized.isMuted
+        volume = normalized.volume
+        isLooping = normalized.isLooping
+        preferredForwardBufferFraction = normalized.preferredForwardBufferFraction
+        if let item = playerItem {
+            applyPreferredForwardBufferIfNeeded(for: item)
+        }
+    }
+
     // MARK: - Private Methods
 
     /// 异步加载 AVAsset 并创建 AVPlayer/AVPlayerItem
@@ -456,7 +497,10 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     }
     
     private func applyPreferredForwardBufferIfNeeded(for item: AVPlayerItem) {
-        guard let fraction = preferredForwardBufferFraction else { return }
+        guard let fraction = preferredForwardBufferFraction else {
+            item.preferredForwardBufferDuration = 0
+            return
+        }
         let total = item.duration.seconds
         guard total.isFinite, total > 0 else { return }
         let clamped = min(max(fraction, 0), 1)
@@ -546,8 +590,8 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
             }
         }
         
-        // 3. 监听播放进度 (每0.1秒回调一次)
-        let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+        // 3. 监听播放进度，避免高频回调持续压主线程。
+        let interval = CMTime(seconds: progressUpdateInterval, preferredTimescale: 600)
         timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             self?.handleTimeUpdate(time)
         }

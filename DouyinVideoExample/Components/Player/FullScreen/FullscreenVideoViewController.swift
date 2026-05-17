@@ -20,6 +20,8 @@ class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable
     private let playback: DYPlaybackCoordinating
     /// 全屏时支持的屏幕方向，默认横屏
     private let fullscreenOrientationMask: UIInterfaceOrientationMask
+    /// 当前对系统声明的屏幕方向，用于退出全屏时切回竖屏
+    private var activeOrientationMask: UIInterfaceOrientationMask
     /// 退出全屏时的回调，用于通知外部恢复状态
     var onDismiss: (() -> Void)?
     
@@ -94,6 +96,10 @@ class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable
         button.isHidden = true
         return button
     }()
+    /// 滑动调节亮度、音量、进度时的提示浮层
+    private let gestureHUDView = FullscreenGestureHUDView()
+    /// 画面滑动手势控制器
+    private lazy var gestureController = FullscreenVideoGestureController(hudView: gestureHUDView)
 
     /// 控制器释放时的日志，便于排查内存是否正确释放
     deinit {
@@ -122,6 +128,7 @@ class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable
         self.player = player
         self.playback = playback
         self.fullscreenOrientationMask = fullscreenOrientationMask
+        self.activeOrientationMask = fullscreenOrientationMask
         super.init(nibName: nil, bundle: nil)
         self.modalPresentationStyle = .fullScreen
     }
@@ -142,7 +149,9 @@ class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable
         speedButton.addTarget(self, action: #selector(handleSpeedButtonTapped), for: .touchUpInside)
         let longPressGesture = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
         longPressGesture.minimumPressDuration = 0.3
+        longPressGesture.delegate = self
         view.addGestureRecognizer(longPressGesture)
+        configureFullscreenGestureController()
         let singleTapGesture = UITapGestureRecognizer(target: self, action: #selector(handleSingleTap(_:)))
         singleTapGesture.numberOfTapsRequired = 1
         let doubleTapGesture = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
@@ -154,7 +163,7 @@ class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable
         view.addGestureRecognizer(doubleTapGesture)
         centerPlayButton.addTarget(self, action: #selector(handleCenterPlayButtonTapped), for: .touchUpInside)
         player.multicastDelegate.add(self)
-        currentSpeed = player.playbackRate
+        currentSpeed = playback.configuration.playbackRate
         updateSpeedButtonTitle()
         playVideo()
         scheduleControlsAutoHide()
@@ -163,16 +172,39 @@ class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable
     /// 视图即将显示，此处预留扩展
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        requestInterfaceOrientation(fullscreenOrientationMask)
     }
     
     /// 视图已经显示，此处预留扩展
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        requestInterfaceOrientation(fullscreenOrientationMask)
+        updateCloseButtonLayout()
     }
 
     /// 视图即将消失，此处预留扩展
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        if isBeingDismissed {
+            requestInterfaceOrientation(.portrait)
+        }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        updateCloseButtonLayout()
+    }
+
+    override func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        updateCloseButtonLayout()
+    }
+
+    override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+        coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+            self?.updateCloseButtonLayout()
+        }
     }
     
     /// 全屏播放时隐藏底部 Home Indicator（指示条）
@@ -182,10 +214,40 @@ class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable
 
     /// 返回全屏播放时支持的屏幕方向
     var dySupportedOrientations: UIInterfaceOrientationMask {
-        return fullscreenOrientationMask
+        return activeOrientationMask
+    }
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
+        return activeOrientationMask
+    }
+
+    override var shouldAutorotate: Bool {
+        return true
+    }
+
+    override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation {
+        return activeOrientationMask.dyPreferredInterfaceOrientation
     }
 
     // MARK: - Private Methods
+
+    private func requestInterfaceOrientation(_ orientationMask: UIInterfaceOrientationMask) {
+        activeOrientationMask = orientationMask
+        if #available(iOS 16.0, *) {
+            setNeedsUpdateOfSupportedInterfaceOrientations()
+            view.window?.windowScene?.requestGeometryUpdate(
+                .iOS(interfaceOrientations: orientationMask),
+                errorHandler: nil
+            )
+        } else {
+            UIDevice.current.setValue(
+                orientationMask.dyPreferredInterfaceOrientation.rawValue,
+                forKey: "orientation"
+            )
+            UIViewController.attemptRotationToDeviceOrientation()
+        }
+        updateCloseButtonLayout()
+    }
     
     /// 构建全屏播放页面的 UI 结构与约束
     private func setupUI() {
@@ -238,23 +300,47 @@ class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable
         }
         
         controlsContainerView.addSubview(closeButton)
-        closeButton.snp.makeConstraints { make in
-            make.leading.equalToSuperview().offset(16)
-            make.top.equalToSuperview().offset(100)
-            make.width.height.equalTo(32)
-        }
+        updateCloseButtonLayout()
         
         view.addSubview(centerPlayButton)
         centerPlayButton.snp.makeConstraints { make in
             make.center.equalToSuperview()
             make.width.height.equalTo(64)
         }
+
+        view.addSubview(gestureHUDView)
+        gestureHUDView.snp.makeConstraints { make in
+            make.center.equalToSuperview()
+            make.width.equalTo(168)
+            make.height.equalTo(92)
+        }
+    }
+
+    private func updateCloseButtonLayout() {
+        guard closeButton.superview != nil else { return }
+        let layout = DYLayoutMetrics.fullscreenCloseButtonLayout(
+            for: self,
+            orientationMask: activeOrientationMask
+        )
+        closeButton.snp.remakeConstraints { make in
+            make.leading.equalToSuperview().offset(layout.leading)
+            make.top.equalToSuperview().offset(layout.top)
+            make.width.height.equalTo(layout.size)
+        }
     }
     
     /// 在播放器容器中开始播放当前视频
     private func playVideo() {
+        updatePlaybackConfiguration { configuration in
+            configuration.videoGravity = .aspectFit
+        }
         playback.playWithCache(originalURL: videoURL, in: playerContainerView, seekTo: currentTime, use: nil)
-        player.videoGravity = .aspectFit
+    }
+
+    private func updatePlaybackConfiguration(_ update: (inout DYVideoPlayerConfiguration) -> Void) {
+        var configuration = playback.configuration
+        update(&configuration)
+        playback.applyConfiguration(configuration)
     }
     
     @objc private func handleClose() {
@@ -266,6 +352,60 @@ class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable
 }
 
 extension FullscreenVideoViewController {
+    /// 配置全屏画面滑动手势，与播放器能力通过回调解耦。
+    private func configureFullscreenGestureController() {
+        gestureController.contextProvider = { [weak self] in
+            guard let self = self else {
+                return FullscreenVideoGestureContext(volume: 0, currentTime: 0, duration: 0)
+            }
+            return FullscreenVideoGestureContext(
+                volume: self.player.volume,
+                currentTime: self.player.currentTime,
+                duration: self.player.duration
+            )
+        }
+        gestureController.excludedViewsProvider = { [weak self] in
+            guard let self = self else { return [] }
+            return [
+                self.centerPlayButton,
+                self.closeButton,
+                self.progressBar,
+                self.speedButton,
+                self.speedSelectorContainerView
+            ]
+        }
+        gestureController.onInteractionBegan = { [weak self] kind in
+            guard let self = self else { return }
+            self.isDraggingProgress = kind == .seek
+            self.isSpeedSelectorVisible = false
+            self.speedSelectorContainerView.isHidden = true
+            self.cancelControlsAutoHide()
+        }
+        gestureController.onVolumeChanged = { [weak self] volume in
+            guard let self = self else { return }
+            self.player.isMuted = false
+            self.player.volume = volume
+            self.updatePlaybackConfiguration { configuration in
+                configuration.isMuted = false
+                configuration.volume = volume
+            }
+        }
+        gestureController.onSeekPreview = { [weak self] targetTime, totalTime, progress in
+            guard let self = self else { return }
+            self.progressBar.updateProgress(to: progress, animated: false)
+            self.updateTimeLabel(currentTime: targetTime, totalTime: totalTime)
+        }
+        gestureController.onSeekFinished = { [weak self] targetTime in
+            guard let self = self else { return }
+            self.isDraggingProgress = false
+            self.player.seek(to: targetTime, isPrecise: true, completion: nil)
+        }
+        gestureController.onInteractionEnded = { [weak self] in
+            self?.scheduleControlsAutoHide()
+        }
+        gestureController.install(on: view)
+    }
+
     /// 配置进度条拖拽相关回调，完成与播放器的联动
     private func configureProgressBarCallbacks() {
         progressBar.didBeginDragging = { [weak self] in
@@ -361,7 +501,9 @@ extension FullscreenVideoViewController {
         updateSpeedButtonTitle()
         isSpeedSelectorVisible = false
         speedSelectorContainerView.isHidden = true
-        player.setPlaybackRate(currentSpeed)
+        updatePlaybackConfiguration { configuration in
+            configuration.playbackRate = currentSpeed
+        }
         scheduleControlsAutoHide()
     }
     
@@ -370,6 +512,7 @@ extension FullscreenVideoViewController {
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
         switch gesture.state {
         case .began, .changed:
+            guard !gestureController.isInteracting else { return }
             if !isFastPlayingByLongPress {
                 if player.state != .playing {
                     player.resume()
@@ -542,6 +685,33 @@ extension FullscreenVideoViewController: UIGestureRecognizerDelegate {
         if touch.view === centerPlayButton || (touch.view?.isDescendant(of: centerPlayButton) ?? false) {
             return false
         }
+        if touch.view === closeButton || (touch.view?.isDescendant(of: closeButton) ?? false) {
+            return false
+        }
+        if touch.view === progressBar || (touch.view?.isDescendant(of: progressBar) ?? false) {
+            return false
+        }
+        if touch.view === speedButton || (touch.view?.isDescendant(of: speedButton) ?? false) {
+            return false
+        }
+        if touch.view === speedSelectorContainerView || (touch.view?.isDescendant(of: speedSelectorContainerView) ?? false) {
+            return false
+        }
         return true
+    }
+}
+
+private extension UIInterfaceOrientationMask {
+    var dyPreferredInterfaceOrientation: UIInterfaceOrientation {
+        switch self {
+        case .landscapeLeft:
+            return .landscapeLeft
+        case .landscape, .landscapeRight:
+            return .landscapeRight
+        case .portraitUpsideDown:
+            return .portraitUpsideDown
+        default:
+            return .portrait
+        }
     }
 }

@@ -35,6 +35,8 @@ public class VideoPreloadManager {
     private let adjustmentThreshold = 5
     private let adaptiveWindowSize = 20
     private var recentPreloadOutcomes: [PreloadOutcome] = []
+    private let cacheReadinessSnapshotTTL: TimeInterval = 1.0
+    private var cacheReadinessSnapshots: [URL: CacheReadinessSnapshot] = [:]
 
     private var preloadingUrls: Set<URL> = []
     private var runningPreloads: Set<URL> = []
@@ -86,11 +88,17 @@ public class VideoPreloadManager {
         case failure
     }
 
+    private struct CacheReadinessSnapshot {
+        let requiredLength: Int
+        let isReady: Bool
+        let checkedAt: Date
+    }
+
     /// - Parameters:
     ///   - cache: 执行实际预加载 / 取消 / 查询缓存的实例，应与播放链路使用同一 `VideoCacheManager`。
     ///   - notificationCenter: 注入的通知中心，默认使用系统默认中心
-    public init(cache: VideoCacheManager = .shared, notificationCenter: NotificationCenter = .default) {
-        self.cache = cache
+    public init(cache: VideoCacheManager? = nil, notificationCenter: NotificationCenter = .default) {
+        self.cache = cache ?? .shared
         self.notificationCenter = notificationCenter
         notificationCenter.addObserver(self, selector: #selector(handlePreloadFinished(_:)), name: .videoCacheManagerPreloadFinished, object: nil)
         notificationCenter.addObserver(self, selector: #selector(handlePreloadFailed(_:)), name: .videoCacheManagerPreloadFailed, object: nil)
@@ -118,6 +126,7 @@ public class VideoPreloadManager {
     /// 实际执行策略计算（由防抖调度）
     private func performStrategyUpdate(currentURL: URL?, allURLs: [URL], currentIndex: Int?) {
         self.currentAllURLs = allURLs
+        self.pruneCacheReadinessSnapshots(keeping: Set(allURLs))
 
         guard !allURLs.isEmpty else {
             self.cancelAllInternal()
@@ -171,7 +180,7 @@ public class VideoPreloadManager {
 
         let newInWindow = urlSet.subtracting(previousWindow)
         for url in newInWindow {
-            if self.cache.hasCachedData(for: url, minimumLength: self.preloadSize) || self.cache.isFullyCached(for: url) {
+            if self.isCacheReadyForCurrentPreload(url) {
                 self.totalPreloadHits += 1
             }
         }
@@ -219,8 +228,7 @@ public class VideoPreloadManager {
         let candidates = preloadURLPriorityOrder.filter { url in
             preloadingUrls.contains(url) &&
             !runningPreloads.contains(url) &&
-            !cache.isFullyCached(for: url) &&
-            !cache.hasCachedData(for: url, minimumLength: preloadSize)
+            !isCacheReadyForCurrentPreload(url)
         }
 
         for url in candidates {
@@ -246,17 +254,53 @@ public class VideoPreloadManager {
         runningPreloads.removeAll()
         preloadURLPriorityOrder.removeAll()
         currentAllURLs.removeAll()
+        cacheReadinessSnapshots.removeAll()
         lastResolvedIndex = nil
     }
 
     /// 清理所有磁盘缓存
     public func clearDiskCache() {
         cache.clearAllCache()
+        cacheReadinessSnapshots.removeAll()
     }
 
     /// 清理指定 URL 的缓存
     public func clearCache(for url: URL) {
         cache.clearCache(for: url)
+        cacheReadinessSnapshots.removeValue(forKey: url)
+    }
+
+    private func isCacheReadyForCurrentPreload(_ url: URL) -> Bool {
+        let now = Date()
+        if let snapshot = cacheReadinessSnapshots[url],
+           snapshot.requiredLength == preloadSize,
+           now.timeIntervalSince(snapshot.checkedAt) <= cacheReadinessSnapshotTTL {
+            return snapshot.isReady
+        }
+
+        let isReady = cache.hasCachedData(for: url, minimumLength: preloadSize) || cache.isFullyCached(for: url)
+        cacheReadinessSnapshots[url] = CacheReadinessSnapshot(
+            requiredLength: preloadSize,
+            isReady: isReady,
+            checkedAt: now
+        )
+        return isReady
+    }
+
+    private func markCacheReadyForCurrentPreload(_ url: URL) {
+        cacheReadinessSnapshots[url] = CacheReadinessSnapshot(
+            requiredLength: preloadSize,
+            isReady: true,
+            checkedAt: Date()
+        )
+    }
+
+    private func invalidateCacheReadinessSnapshot(for url: URL) {
+        cacheReadinessSnapshots.removeValue(forKey: url)
+    }
+
+    private func pruneCacheReadinessSnapshots(keeping urls: Set<URL>) {
+        cacheReadinessSnapshots = cacheReadinessSnapshots.filter { urls.contains($0.key) }
     }
 
     /// 处理预加载完成通知，累加成功计数
@@ -266,6 +310,7 @@ public class VideoPreloadManager {
             self.recordPreloadOutcome(.success)
             if let userInfo = notification.userInfo, let url = userInfo["url"] as? URL {
                 self.runningPreloads.remove(url)
+                self.markCacheReadyForCurrentPreload(url)
             }
             self.schedulePreloads()
             self.checkAndAdjustPreloadSize()
@@ -279,6 +324,7 @@ public class VideoPreloadManager {
             self.recordPreloadOutcome(.failure)
             if let userInfo = notification.userInfo, let url = userInfo["url"] as? URL {
                 self.runningPreloads.remove(url)
+                self.invalidateCacheReadinessSnapshot(for: url)
             }
             self.schedulePreloads()
             self.checkAndAdjustPreloadSize()

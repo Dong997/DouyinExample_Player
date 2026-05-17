@@ -5,6 +5,7 @@ import UIKit
 public protocol DYPlaybackCoordinating: AnyObject {
     /// 当前作为主 UI 绑定的播放器实例（与 `DYPlayerPool` 中的 current 一致）。
     var currentPlayer: DYVideoPlayer { get }
+    var configuration: DYVideoPlayerConfiguration { get set }
     var preloadPercentage: Double { get set }
 
     func acquirePreloadPlayer() -> DYVideoPlayer?
@@ -13,6 +14,7 @@ public protocol DYPlaybackCoordinating: AnyObject {
     func play(url: URL, in view: UIView, seekTo: TimeInterval?)
     func playWithCache(originalURL: URL, in view: UIView, seekTo: TimeInterval?, use targetPlayer: DYVideoPlayer?)
     func preload(originalURL: URL, use targetPlayer: DYVideoPlayer)
+    func applyConfiguration(_ configuration: DYVideoPlayerConfiguration)
     func pause()
     func resume()
     func stop()
@@ -43,17 +45,30 @@ public final class DYPlayerManager {
         set { playback.preloadPercentage = newValue }
     }
 
+    public var configuration: DYVideoPlayerConfiguration {
+        get { playback.configuration }
+        set {
+            playback.configuration = newValue
+            pool.applyConfigurationToAll(playback.configuration)
+        }
+    }
+
     private init() {}
 
     // MARK: - Pool
 
     /// 若返回 `nil`，表示没有独立预加载槽位，仅适合跳过预加载；若要立刻播放入口请使用 `player` 或 `acquirePreloadPlayer() ?? player`。
     public func acquirePreloadPlayer() -> DYVideoPlayer? {
-        pool.acquirePreloadPlayer()
+        let player = pool.acquirePreloadPlayer()
+        if let player = player {
+            playback.configure(player)
+        }
+        return player
     }
 
     public func promoteToCurrent(_ player: DYVideoPlayer) {
         pool.promoteToCurrent(player)
+        playback.configure(player)
     }
 
     // MARK: - Playback
@@ -74,6 +89,10 @@ public final class DYPlayerManager {
     /// 使用指定播放器实例对资源做 `prepare`（会走缓存代理）。列表邻条预取应优先用 `VideoPreloadManager` + `VideoCacheManager.preload`，避免与 HTTP Range 预拉重复；本方法保留给需要「播放器已就绪」的场景。
     public func preload(originalURL: URL, use targetPlayer: DYVideoPlayer) {
         playback.preload(originalURL: originalURL, use: targetPlayer)
+    }
+
+    public func applyConfiguration(_ configuration: DYVideoPlayerConfiguration) {
+        self.configuration = configuration
     }
 
     public func pause() {

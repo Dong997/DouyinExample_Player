@@ -65,13 +65,14 @@ class HomeViewModel: ObservableObject {
     ///   - resumeTimeStore: 播放恢复时间存储
     init(
         coordinator: PlayerCoordinator? = nil,
-        playback: DYPlaybackCoordinating = DYPlayerManager.shared,
-        preloadManager: VideoPreloadManager = .shared,
+        playback: DYPlaybackCoordinating? = nil,
+        preloadManager: VideoPreloadManager? = nil,
         resumeTimeStore: ResumeTimeStore = ResumeTimeStore()
     ) {
+        let playback = playback ?? DYPlayerManager.shared
         self.playback = playback
         self.coordinator = coordinator ?? PlayerCoordinator(playback: playback, resumeTimeStore: resumeTimeStore)
-        self.preloadManager = preloadManager
+        self.preloadManager = preloadManager ?? .shared
         self.resumeTimeStore = resumeTimeStore
         bindCoordinator()
         loadData()
@@ -131,6 +132,16 @@ class HomeViewModel: ObservableObject {
     /// 设置当前播放器倍速
     func setCurrentPlaybackRate(_ rate: Float) {
         coordinator.setCurrentPlaybackRate(rate)
+    }
+
+    /// 设置当前播放器画面填充模式
+    func setCurrentVideoGravity(_ gravity: DYVideoGravity) {
+        coordinator.setCurrentVideoGravity(gravity)
+    }
+
+    /// 应用播放器配置
+    func applyPlayerConfiguration(_ configuration: DYVideoPlayerConfiguration) {
+        coordinator.applyConfiguration(configuration)
     }
 
     /// 切换当前播放器播放/暂停

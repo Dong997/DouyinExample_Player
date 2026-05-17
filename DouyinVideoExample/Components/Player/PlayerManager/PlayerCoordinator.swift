@@ -93,15 +93,17 @@ class PlayerCoordinator: NSObject {
     ///   - resumeTimeStore: 播放恢复时间存储
     ///   - networkMonitor: 网络状态监听器
     init(
-        playback: DYPlaybackCoordinating = DYPlayerManager.shared,
-        cache: VideoCacheBlacklisting = VideoCacheManager.shared,
+        playback: DYPlaybackCoordinating? = nil,
+        cache: VideoCacheBlacklisting? = nil,
         resumeTimeStore: ResumeTimeStore = ResumeTimeStore(),
-        networkMonitor: NetworkMonitor = .shared
+        networkMonitor: NetworkMonitor? = nil
     ) {
+        let playback = playback ?? DYPlayerManager.shared
+        let cache = cache ?? VideoCacheManager.shared
         self.playback = playback
         self.retryHandler = PlaybackRetryHandler(cache: cache)
         self.resumeTimeStore = resumeTimeStore
-        self.networkMonitor = networkMonitor
+        self.networkMonitor = networkMonitor ?? .shared
         super.init()
         bindNetworkStatus()
     }
@@ -166,6 +168,7 @@ class PlayerCoordinator: NSObject {
         pendingPausePlayer = nil
 
         // 记录旧播放器引用，但不立即暂停 —— 等新播放器启动后再停旧
+        let previousIndex = currentPlayingIndexPath?.item
         let previousPlayer: DYVideoPlayer? = (currentPlayingIndexPath != indexPath) ? currentPlayer : nil
         if let current = currentPlayingIndexPath, current != indexPath {
             saveResumeTime(for: current)
@@ -230,7 +233,7 @@ class PlayerCoordinator: NSObject {
             pendingPausePlayer = nil
         }
 
-        managePreloadPlayers(currentIndex: index, videos: videos)
+        managePreloadPlayers(currentIndex: index, previousIndex: previousIndex, videos: videos)
     }
 
     /// 暂停当前播放器
@@ -250,7 +253,21 @@ class PlayerCoordinator: NSObject {
 
     /// 设置当前播放器倍速
     func setCurrentPlaybackRate(_ rate: Float) {
-        currentPlayer.setPlaybackRate(rate)
+        var configuration = playback.configuration
+        configuration.playbackRate = rate
+        playback.applyConfiguration(configuration)
+    }
+
+    /// 设置当前播放器画面填充模式
+    func setCurrentVideoGravity(_ gravity: DYVideoGravity) {
+        var configuration = playback.configuration
+        configuration.videoGravity = gravity
+        playback.applyConfiguration(configuration)
+    }
+
+    /// 应用播放器配置到当前播放编排层
+    func applyConfiguration(_ configuration: DYVideoPlayerConfiguration) {
+        playback.applyConfiguration(configuration)
     }
 
     /// 切换当前播放器播放/暂停
@@ -320,15 +337,20 @@ class PlayerCoordinator: NSObject {
 
     // MARK: - Preload Management
 
-    /// 管理预加载播放器：保留当前±1索引，超出范围的移入最近播放缓存（暂停不销毁）
-    /// 回滑时缓存命中可直接恢复，无需重新加载视频
+    /// 管理播放器级预热：保留当前索引与滑动方向上的下一屏，超出范围的移入最近播放缓存（暂停不销毁）。
+    ///
+    /// 字节级预缓存由 `VideoPreloadManager` 负责当前前后窗口；这里仅对“最可能马上切到”的一条做
+    /// AVPlayer/AVPlayerItem 预热，避免前后两条同时走播放器 prepare 与缓存 Range 预拉造成重复资源占用。
+    /// 回滑已播放过的视频时优先命中最近播放缓存，未命中时仍可受益于字节级预缓存。
     /// - Parameters:
     ///   - currentIndex: 当前播放索引
+    ///   - previousIndex: 上一次播放索引，用于判断滑动方向；首次播放默认预热下一条
     ///   - videos: 完整视频列表
-    func managePreloadPlayers(currentIndex: Int, videos: [VideoModel]) {
+    func managePreloadPlayers(currentIndex: Int, previousIndex: Int?, videos: [VideoModel]) {
         var keepIndices = Set([currentIndex])
-        if currentIndex + 1 < videos.count { keepIndices.insert(currentIndex + 1) }
-        if currentIndex - 1 >= 0 { keepIndices.insert(currentIndex - 1) }
+        if let predictedIndex = predictedPreloadIndex(currentIndex: currentIndex, previousIndex: previousIndex, videos: videos) {
+            keepIndices.insert(predictedIndex)
+        }
 
         let keysToRemove = playerMap.keys.filter { !keepIndices.contains($0) }
         for key in keysToRemove {
@@ -346,8 +368,23 @@ class PlayerCoordinator: NSObject {
         // 淘汰超出容量的缓存条目，stop+reset 归还对象池
         trimRecentlyPlayedCache()
 
-        preloadVideo(at: currentIndex + 1, videos: videos)
-        preloadVideo(at: currentIndex - 1, videos: videos)
+        if let predictedIndex = predictedPreloadIndex(currentIndex: currentIndex, previousIndex: previousIndex, videos: videos) {
+            preloadVideo(at: predictedIndex, videos: videos)
+        }
+    }
+
+    /// 根据播放索引变化推断下一次最可能进入的页面：下滑/首次播放预热后一条，上滑预热前一条。
+    private func predictedPreloadIndex(currentIndex: Int, previousIndex: Int?, videos: [VideoModel]) -> Int? {
+        let direction: Int
+        if let previousIndex = previousIndex, currentIndex < previousIndex {
+            direction = -1
+        } else {
+            direction = 1
+        }
+
+        let candidate = currentIndex + direction
+        guard videos.indices.contains(candidate) else { return nil }
+        return candidate
     }
 
     /// 淘汰最近播放缓存中超出容量的旧条目

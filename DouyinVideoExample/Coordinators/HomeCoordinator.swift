@@ -20,8 +20,9 @@ class HomeCoordinator: Coordinator {
     init(
         navigationController: UINavigationController,
         viewModel: HomeViewModel? = nil,
-        playback: DYPlaybackCoordinating = DYPlayerManager.shared
+        playback: DYPlaybackCoordinating? = nil
     ) {
+        let playback = playback ?? DYPlayerManager.shared
         self.navigationController = navigationController
         self.viewModel = viewModel ?? HomeViewModel(playback: playback)
         self.playback = playback

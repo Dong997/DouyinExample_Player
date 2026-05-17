@@ -11,6 +11,11 @@ import Combine
 /// 5. 通过 Coordinator 处理导航（不直接 push/present）
 class HomeViewController: UIViewController, DYOrientationConfigurable {
 
+    #if DEBUG
+    /// 调试缓存问题时可临时打开；默认保留磁盘缓存，避免抵消预加载收益。
+    private static let shouldClearVideoCacheOnLaunch = false
+    #endif
+
     // MARK: - Dependencies
 
     private let viewModel: HomeViewModel
@@ -21,23 +26,11 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
     /// 标记是否已触发首次视频播放，避免 reloadData 后硬编码延迟
     private var hasPlayedFirstVideo = false
 
-    /// 首次自动播放重试任务。首次启动时数据、布局、cell 创建可能不在同一个 runloop 完成。
-    private var firstAutoplayWorkItem: DispatchWorkItem?
+    /// 中心可见视频播放确认任务。首播、滚动停止、程序滚动结束统一走这一条路径。
+    private var centerPlaybackWorkItem: DispatchWorkItem?
 
-    /// 滚动停止后的播放确认任务。快速滑动结束时，分页定位、cell 复用、预加载绑定可能跨几个 runloop 完成。
-    private var scrollEndPlaybackWorkItem: DispatchWorkItem?
-
-    /// 当前滚动中检测到的目标播放索引，避免 scrollViewDidScroll 重复触发
-    private var pendingPlayIndexPath: IndexPath?
-
-    /// 上一次 scrollViewDidScroll 记录的 contentOffset.y，用于计算滚动速度
-    private var lastContentOffsetY: CGFloat = 0
-
-    /// 上一次 scrollViewDidScroll 的时间戳，用于计算滚动速度
-    private var lastScrollTime: TimeInterval = 0
-
-    /// 判定为"快速滚动"的速度阈值（points/秒），超过此值时延迟播放
-    private let fastScrollVelocityThreshold: CGFloat = 800
+    /// 追加推荐视频后需要滚动到的首条索引；等待 collectionView 增量插入完成后再执行。
+    private var pendingRecommendedIndexPath: IndexPath?
 
     /// 当前正在播放视频的 Cell 弱引用
     /// 避免通过 cellForItem(at:) 查找时因 Cell 未就绪/已回收导致封面图无法隐藏
@@ -84,12 +77,13 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
     // MARK: - Initialization
     init(
         viewModel: HomeViewModel? = nil,
-        playback: DYPlaybackCoordinating = DYPlayerManager.shared,
-        videoCache: VideoCacheManager = .shared
+        playback: DYPlaybackCoordinating? = nil,
+        videoCache: VideoCacheManager? = nil
     ) {
+        let playback = playback ?? DYPlayerManager.shared
         self.viewModel = viewModel ?? HomeViewModel()
         self.playback = playback
-        self.videoCache = videoCache
+        self.videoCache = videoCache ?? .shared
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -107,7 +101,11 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
         super.viewDidLoad()
         view.backgroundColor = .gray
 
-        videoCache.clearAllCache()
+        #if DEBUG
+        if Self.shouldClearVideoCacheOnLaunch {
+            videoCache.clearAllCache()
+        }
+        #endif
         videoCache.start()
 
         navigationController?.interactivePopGestureRecognizer?.delegate = self
@@ -124,7 +122,7 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        scheduleAutoplayForVisibleVideoIfNeeded()
+        scheduleVisibleCenterPlayback(reason: "viewDidAppear", retryCount: 40, delay: 0.05)
     }
 
     override func viewDidLayoutSubviews() {
@@ -207,11 +205,7 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
                 let currentCount = self.collectionView.numberOfItems(inSection: 0)
                 AppLog.ui.info("Home videos update oldCount=\(currentCount), newCount=\(videos.count), windowReady=\(self.view.window != nil)")
                
-                if currentCount != videos.count {
-                    self.hasPlayedFirstVideo = false
-                    self.collectionView.reloadData()
-                    self.scheduleAutoplayForVisibleVideoIfNeeded()
-                }
+                self.applyVideoCollectionUpdate(oldCount: currentCount, newCount: videos.count)
             }
             .store(in: &cancellables)
 
@@ -224,8 +218,8 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
                 }
                 if state == .playing {
                     self?.hasPlayedFirstVideo = true
-                    self?.firstAutoplayWorkItem?.cancel()
-                    self?.firstAutoplayWorkItem = nil
+                    self?.centerPlaybackWorkItem?.cancel()
+                    self?.centerPlaybackWorkItem = nil
                     self?.fadeOutCoverImage()
                 }
             }
@@ -271,11 +265,11 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
 
         let player = viewModel.currentPlayer
         AppLog.ui.info("Home playVideo requested index=\(index), playerState=\(String(describing: player.state)), playerURL=\(String(describing: player.currentURL?.absoluteString)), originalURL=\(String(describing: player.originalURL?.absoluteString))")
-        if player.state == .playing {
-            // 播放器已在播放（预加载命中），立即隐藏封面图
+        if player.state == .playing, player.isPlaying(url: video.videoURL) {
+            // 只有真正进入播放态后才隐藏占位图，避免 ready 但首帧未渲染时露黑。
             cell.hideCoverImage(animated: true)
         } else {
-            // 播放器尚未就绪，显示封面图等待播放器画面渲染
+            // 播放开始前保持 last-frame/封面稳定，等待 .playing 回调后再淡出。
             cell.showCoverImage()
         }
 
@@ -308,32 +302,48 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
         viewModel.restorePlayer(at: indexPath, containerView: cell.playerContainerView)
     }
 
-    private func scheduleAutoplayForVisibleVideoIfNeeded(retryCount: Int = 40) {
-        firstAutoplayWorkItem?.cancel()
-        AppLog.ui.info("Home schedule autoplay retryCount=\(retryCount), videos=\(self.viewModel.videos.count), windowReady=\(self.view.window != nil), hasPlayedFirstVideo=\(self.hasPlayedFirstVideo)")
+    private func applyVideoCollectionUpdate(oldCount: Int, newCount: Int) {
+        guard oldCount != newCount else { return }
+
+        if oldCount == 0 || newCount < oldCount {
+            hasPlayedFirstVideo = false
+            collectionView.reloadData()
+            runPendingRecommendedPlaybackIfNeeded()
+            scheduleVisibleCenterPlayback(reason: "videosReload", retryCount: 40, delay: 0.05)
+            return
+        }
+
+        let insertedIndexPaths = (oldCount..<newCount).map { IndexPath(item: $0, section: 0) }
+        collectionView.performBatchUpdates {
+            collectionView.insertItems(at: insertedIndexPaths)
+        } completion: { [weak self] _ in
+            guard let self = self else { return }
+            self.runPendingRecommendedPlaybackIfNeeded()
+            self.scheduleVisibleCenterPlayback(reason: "videosInserted", retryCount: 10, delay: 0.04)
+        }
+    }
+
+    private func scheduleVisibleCenterPlayback(reason: String, retryCount: Int = 6, delay: TimeInterval = 0.04) {
+        centerPlaybackWorkItem?.cancel()
+        AppLog.ui.info("Home schedule center playback reason=\(reason), retryCount=\(retryCount), videos=\(self.viewModel.videos.count), windowReady=\(self.view.window != nil)")
 
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
-            if self.attemptAutoplayForVisibleVideoIfNeeded() {
+            if self.ensureVisibleCenterVideoPlaying(reason: reason) {
                 return
             }
             guard retryCount > 0 else { return }
-            self.scheduleAutoplayForVisibleVideoIfNeeded(retryCount: retryCount - 1)
+            self.scheduleVisibleCenterPlayback(reason: reason, retryCount: retryCount - 1, delay: delay)
         }
-        firstAutoplayWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
+        centerPlaybackWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     @discardableResult
-    private func attemptAutoplayForVisibleVideoIfNeeded() -> Bool {
+    private func ensureVisibleCenterVideoPlaying(reason: String) -> Bool {
         guard isViewLoaded, view.window != nil, !viewModel.videos.isEmpty else {
-            AppLog.ui.info("Home autoplay skipped loaded=\(self.isViewLoaded), windowReady=\(self.view.window != nil), videos=\(self.viewModel.videos.count)")
+            AppLog.ui.info("Home center playback skipped reason=\(reason), loaded=\(self.isViewLoaded), windowReady=\(self.view.window != nil), videos=\(self.viewModel.videos.count)")
             return false
-        }
-        if viewModel.currentPlayer.state == .playing {
-            hasPlayedFirstVideo = true
-            AppLog.ui.info("Home autoplay already playing")
-            return true
         }
 
         view.layoutIfNeeded()
@@ -341,15 +351,27 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
 
         let visibleRect = CGRect(origin: collectionView.contentOffset, size: collectionView.bounds.size)
         let visiblePoint = CGPoint(x: visibleRect.midX, y: visibleRect.midY)
+        let indexPath = collectionView.indexPathForItem(at: visiblePoint) ?? centeredVisibleIndexPath()
 
-        if let indexPath = collectionView.indexPathForItem(at: visiblePoint),
-           let cell = collectionView.cellForItem(at: indexPath) as? VideoCell {
-            AppLog.ui.info("Home autoplay attempt index=\(indexPath.item), visiblePoint=\(String(describing: visiblePoint)), bounds=\(String(describing: self.collectionView.bounds)), offset=\(String(describing: self.collectionView.contentOffset))")
-            _ = playVideo(at: indexPath, with: cell)
-            return viewModel.currentPlayer.state == .playing
+        guard let indexPath = indexPath else {
+            AppLog.ui.warning("Home center playback missing indexPath reason=\(reason), point=\(String(describing: visiblePoint)), visibleCount=\(self.collectionView.visibleCells.count)")
+            return false
         }
-        AppLog.ui.warning("Home autoplay no visible cell at point=\(String(describing: visiblePoint)), bounds=\(String(describing: self.collectionView.bounds)), visibleCells=\(self.collectionView.visibleCells.count)")
-        return false
+
+        let player = viewModel.currentPlayer
+        AppLog.ui.info("Home center playback reason=\(reason), index=\(indexPath.item), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath)), playerState=\(String(describing: player.state)), point=\(String(describing: visiblePoint))")
+        if viewModel.currentPlayingIndexPath == indexPath, player.state == .playing {
+            hasPlayedFirstVideo = true
+            return true
+        }
+
+        guard let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else {
+            AppLog.ui.warning("Home center playback missing cell reason=\(reason), index=\(indexPath.item), visibleCount=\(self.collectionView.visibleCells.count)")
+            return false
+        }
+
+        _ = playVideo(at: indexPath, with: cell)
+        return viewModel.currentPlayer.state == .playing
     }
 
     private func presentFullscreen(for indexPath: IndexPath) {
@@ -357,8 +379,8 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
         guard let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
         let video = viewModel.videos[indexPath.item]
         let currentTime = viewModel.currentPlayer.currentTime
-        let horizontalAspectRatio = video.aspectRatio ?? 1.1
-        let fullscreenOrientationMask: UIInterfaceOrientationMask = horizontalAspectRatio > 1.0 ? .landscapeRight : .portrait
+        let aspectRatio = video.aspectRatio ?? 1.0
+        let fullscreenOrientationMask: UIInterfaceOrientationMask = aspectRatio > 1.0 ? .landscapeRight : .portrait
 
         coordinator?.presentFullscreen(
             videoURL: video.videoURL,
@@ -423,12 +445,15 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
     func playRecommendedVideo() {
         let moreVideos = VideoModel.moreData()
         let startIndex = viewModel.videos.count
+        pendingRecommendedIndexPath = IndexPath(item: startIndex, section: 0)
         viewModel.videos.append(contentsOf: moreVideos)
-        collectionView.reloadData()
+    }
 
-        let targetIndexPath = IndexPath(item: startIndex, section: 0)
+    private func runPendingRecommendedPlaybackIfNeeded() {
+        guard let targetIndexPath = pendingRecommendedIndexPath,
+              viewModel.videos.indices.contains(targetIndexPath.item) else { return }
+        pendingRecommendedIndexPath = nil
         collectionView.scrollToItem(at: targetIndexPath, at: .centeredVertically, animated: true)
-
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self = self else { return }
             if self.collectionView.cellForItem(at: targetIndexPath) is VideoCell {
@@ -448,7 +473,8 @@ extension HomeViewController: UICollectionViewDelegate, UICollectionViewDataSour
 
     func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
         let cell = collectionView.dequeueReusableCell(withReuseIdentifier: VideoCell.identifier, for: indexPath) as! VideoCell
-        cell.configure(with: viewModel.videos[indexPath.item])
+        let video = viewModel.videos[indexPath.item]
+        cell.configure(with: video)
         return cell
     }
 
@@ -468,12 +494,7 @@ extension HomeViewController: UICollectionViewDelegate, UICollectionViewDataSour
 
         if !hasPlayedFirstVideo, indexPath.item == 0 {
             AppLog.ui.info("Home willDisplay triggers first play index=0")
-            _ = playVideo(at: indexPath, with: videoCell)
-            hasPlayedFirstVideo = viewModel.currentPlayer.state == .playing
-            if hasPlayedFirstVideo {
-                firstAutoplayWorkItem?.cancel()
-                firstAutoplayWorkItem = nil
-            }
+            scheduleVisibleCenterPlayback(reason: "firstWillDisplay", retryCount: 20, delay: 0.03)
         }
     }
 
@@ -481,78 +502,18 @@ extension HomeViewController: UICollectionViewDelegate, UICollectionViewDataSour
         viewModel.togglePlayPause()
     }
 
-    func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        let visibleRect = CGRect(origin: collectionView.contentOffset, size: collectionView.bounds.size)
-        let visiblePoint = CGPoint(x: visibleRect.midX, y: visibleRect.midY)
-        guard let targetIndexPath = collectionView.indexPathForItem(at: visiblePoint) else { return }
-
-        guard targetIndexPath != viewModel.currentPlayingIndexPath && targetIndexPath != pendingPlayIndexPath else { return }
-
-        let now = CACurrentMediaTime()
-        let deltaY = abs(scrollView.contentOffset.y - lastContentOffsetY)
-        let deltaTime = now - lastScrollTime
-        let velocity: CGFloat = deltaTime > 0 ? deltaY / CGFloat(deltaTime) : 0
-
-        lastContentOffsetY = scrollView.contentOffset.y
-        lastScrollTime = now
-
-        pendingPlayIndexPath = targetIndexPath
-
-        if velocity < fastScrollVelocityThreshold {
-            playVideo(at: targetIndexPath)
-        }
-    }
-
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
-        schedulePlayVideoForVisibleCenter()
+        scheduleVisibleCenterPlayback(reason: "didEndDecelerating")
     }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
         if !decelerate {
-            schedulePlayVideoForVisibleCenter()
+            scheduleVisibleCenterPlayback(reason: "didEndDragging")
         }
     }
 
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
-        schedulePlayVideoForVisibleCenter()
-    }
-
-    private func schedulePlayVideoForVisibleCenter(retryCount: Int = 6) {
-        scrollEndPlaybackWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
-            if self.playVideoForVisibleCenter() {
-                return
-            }
-            guard retryCount > 0 else { return }
-            self.schedulePlayVideoForVisibleCenter(retryCount: retryCount - 1)
-        }
-        scrollEndPlaybackWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: workItem)
-    }
-
-    /// 滚动结束后播放可视区域中心对应的视频，并重置速度追踪状态
-    @discardableResult
-    private func playVideoForVisibleCenter() -> Bool {
-        pendingPlayIndexPath = nil
-        lastContentOffsetY = 0
-        lastScrollTime = 0
-
-        collectionView.layoutIfNeeded()
-        let visibleRect = CGRect(origin: collectionView.contentOffset, size: collectionView.bounds.size)
-        let visiblePoint = CGPoint(x: visibleRect.midX, y: visibleRect.midY)
-        let indexPath = collectionView.indexPathForItem(at: visiblePoint) ?? centeredVisibleIndexPath()
-        guard let indexPath = indexPath else {
-            AppLog.ui.warning("Home play visible center missing indexPath point=\(String(describing: visiblePoint)), visibleCount=\(self.collectionView.visibleCells.count)")
-            return false
-        }
-
-        let player = viewModel.currentPlayer
-        AppLog.ui.info("Home play visible center index=\(indexPath.item), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath)), playerState=\(String(describing: player.state)), playerURL=\(String(describing: player.currentURL?.absoluteString))")
-        if viewModel.currentPlayingIndexPath == indexPath, player.state == .playing {
-            return true
-        }
-        return playVideo(at: indexPath)
+        scheduleVisibleCenterPlayback(reason: "didEndScrollingAnimation")
     }
 
     private func centeredVisibleIndexPath() -> IndexPath? {

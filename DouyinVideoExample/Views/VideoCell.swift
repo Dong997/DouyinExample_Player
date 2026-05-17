@@ -54,6 +54,7 @@ class VideoCell: UICollectionViewCell {
     let controlView = DYPlayerControlView()
     
     var onTitleTapped: (() -> Void)?
+    private var coverFadeAnimator: UIViewPropertyAnimator?
     
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -103,7 +104,8 @@ class VideoCell: UICollectionViewCell {
     func configure(with model: VideoModel) {
         titleLabel.text = model.title
         controlView.resetForReuse()
-        
+        coverImageView.layer.removeAllAnimations()
+
         if let coverImage = model.coverImage {
             coverImageView.image = coverImage
             coverImageView.isHidden = false
@@ -121,6 +123,7 @@ class VideoCell: UICollectionViewCell {
             coverImageView.isHidden = true
         }
         
+//        controlView.updateAspectRatio(model.aspectRatio, shouldShowFullscreenButton: true)
         let isHorizontal = (model.aspectRatio ?? 0) > 1.0
         controlView.updateAspectRatio(model.aspectRatio, shouldShowFullscreenButton: isHorizontal)
     }
@@ -129,7 +132,10 @@ class VideoCell: UICollectionViewCell {
         super.prepareForReuse()
         controlView.delegate = nil
         onTitleTapped = nil
+        coverFadeAnimator?.stopAnimation(true)
+        coverFadeAnimator = nil
         controlView.resetForReuse()
+        coverImageView.layer.removeAllAnimations()
         coverImageView.image = nil
         coverImageView.isHidden = false
         coverImageView.alpha = 1.0
@@ -140,20 +146,40 @@ class VideoCell: UICollectionViewCell {
     func hideCoverImage(animated: Bool) {
         if animated {
             guard !coverImageView.isHidden, coverImageView.alpha > 0.01 else { return }
-            UIView.animate(withDuration: 0.3, animations: {
+            coverFadeAnimator?.stopAnimation(true)
+            let animator = UIViewPropertyAnimator(duration: 0.42, curve: .easeInOut) {
                 self.coverImageView.alpha = 0
-            }, completion: { _ in
+            }
+            animator.addCompletion { [weak self] position in
+                guard position == .end, let self = self else { return }
                 self.coverImageView.isHidden = true
-            })
+                self.coverFadeAnimator = nil
+            }
+            coverFadeAnimator = animator
+            animator.startAnimation()
         } else {
+            coverFadeAnimator?.stopAnimation(true)
+            coverFadeAnimator = nil
+            coverImageView.layer.removeAllAnimations()
             coverImageView.alpha = 0
             coverImageView.isHidden = true
         }
     }
 
     /// 显示封面图（新视频开始加载时调用）
-    func showCoverImage() {
+    func showCoverImage(animated: Bool = false) {
+        coverFadeAnimator?.stopAnimation(true)
+        coverFadeAnimator = nil
+        coverImageView.layer.removeAllAnimations()
+        let shouldFadeIn = animated && (coverImageView.isHidden || coverImageView.alpha < 0.99)
         coverImageView.isHidden = false
-        coverImageView.alpha = 1.0
+        if shouldFadeIn {
+            coverImageView.alpha = max(coverImageView.alpha, 0)
+            UIView.animate(withDuration: 0.18, delay: 0, options: [.curveEaseOut, .beginFromCurrentState, .allowUserInteraction]) {
+                self.coverImageView.alpha = 1.0
+            }
+        } else {
+            coverImageView.alpha = 1.0
+        }
     }
 }

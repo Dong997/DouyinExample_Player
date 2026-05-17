@@ -48,7 +48,7 @@ final class FullscreenVideoPresentAnimator: NSObject, UIViewControllerAnimatedTr
     /// 全屏方向掩码，用于确定是否需要横屏旋转
     private let fullscreenOrientationMask: UIInterfaceOrientationMask
     /// 转场动画时长
-    private let animationDuration: TimeInterval = 0.35
+    private let animationDuration: TimeInterval = 0.28
     
     /// 初始化进入动画控制器
     /// - Parameters:
@@ -74,63 +74,47 @@ final class FullscreenVideoPresentAnimator: NSObject, UIViewControllerAnimatedTr
             transitionContext.completeTransition(false)
             return
         }
-        
+
+        let dimmingView = UIView(frame: containerView.bounds)
+        dimmingView.backgroundColor = .black
+        dimmingView.alpha = 0
+
         let originView = self.originView
-        let snapshot: UIView
-        let startFrame: CGRect
-        
-        if let originView = originView,
-           let generatedSnapshot = originView.snapshotView(afterScreenUpdates: false) {
-            snapshot = generatedSnapshot
-            startFrame = originView.convert(originView.bounds, to: containerView)
-        } else {
-            snapshot = toView.snapshotView(afterScreenUpdates: true) ?? toView
-            startFrame = containerView.bounds
+        let originSnapshot = originView?.snapshotView(afterScreenUpdates: false)
+        if let originView, let originSnapshot {
+            originSnapshot.frame = originView.convert(originView.bounds, to: containerView)
+            originSnapshot.layer.masksToBounds = true
+            originSnapshot.layer.cornerCurve = .continuous
         }
-        
-        snapshot.frame = startFrame
+
         /// 全屏目标视图填满容器，先设置为透明，待动画结束显示
         toView.frame = containerView.bounds
         toView.alpha = 0
-        
+        toView.transform = CGAffineTransform(scaleX: 0.985, y: 0.985)
+
+        containerView.addSubview(dimmingView)
         containerView.addSubview(toView)
-        containerView.addSubview(snapshot)
-        
-        let isLandscapeFullscreen: Bool
-        switch fullscreenOrientationMask {
-        case .landscape, .landscapeLeft, .landscapeRight:
-            isLandscapeFullscreen = true
-        default:
-            isLandscapeFullscreen = false
+        if let originSnapshot {
+            containerView.addSubview(originSnapshot)
         }
-        
-        let finalCenter = CGPoint(x: containerView.bounds.midX, y: containerView.bounds.midY)
-        let finalBounds = containerView.bounds
-        
-        UIView.animate(
-            withDuration: animationDuration,
-            delay: 0,
-            options: [.curveEaseInOut]
-        ) {
-            if isLandscapeFullscreen {
-                snapshot.center = finalCenter
-                snapshot.bounds = finalBounds
-                let angle: CGFloat
-                switch self.fullscreenOrientationMask {
-                case .landscapeLeft:
-                    angle = -.pi / 2
-                default:
-                    angle = .pi / 2
-                }
-                snapshot.transform = CGAffineTransform(rotationAngle: angle)
-            } else {
-                snapshot.frame = finalBounds
-            }
+
+        let animator = UIViewPropertyAnimator(duration: animationDuration, curve: .easeOut) {
+            dimmingView.alpha = 0.55
             toView.alpha = 1
-        } completion: { finished in
-            snapshot.removeFromSuperview()
-            transitionContext.completeTransition(finished)
+            toView.transform = .identity
         }
+        animator.addAnimations({
+            originSnapshot?.alpha = 0
+        }, delayFactor: 0.35)
+        animator.addCompletion { position in
+            let didComplete = position == .end && !transitionContext.transitionWasCancelled
+            originSnapshot?.removeFromSuperview()
+            dimmingView.removeFromSuperview()
+            toView.alpha = 1
+            toView.transform = .identity
+            transitionContext.completeTransition(didComplete)
+        }
+        animator.startAnimation()
     }
 }
 
@@ -141,7 +125,7 @@ final class FullscreenVideoDismissAnimator: NSObject, UIViewControllerAnimatedTr
     /// 全屏方向掩码，用于确定横竖屏退出策略
     private let fullscreenOrientationMask: UIInterfaceOrientationMask
     /// 转场动画时长
-    private let animationDuration: TimeInterval = 0.15
+    private let animationDuration: TimeInterval = 0.24
     
     /// 初始化退出动画控制器
     /// - Parameters:
@@ -171,57 +155,29 @@ final class FullscreenVideoDismissAnimator: NSObject, UIViewControllerAnimatedTr
             return
         }
         
-        let isLandscapeFullscreen: Bool
-        switch fullscreenOrientationMask {
-        case .landscape, .landscapeLeft, .landscapeRight:
-            isLandscapeFullscreen = true
-        default:
-            isLandscapeFullscreen = false
-        }
-        
-        guard let snapshot = fromView.snapshotView(afterScreenUpdates: false) else {
-            UIView.animate(
-                withDuration: animationDuration,
-                delay: 0,
-                options: [.curveEaseInOut]
-            ) {
-                fromView.alpha = 0
-            } completion: { finished in
-                fromView.alpha = 1
-                transitionContext.completeTransition(finished)
-            }
-            return
-        }
-        
-        snapshot.frame = fromView.frame
-        snapshot.backgroundColor = .clear
         toView.frame = containerView.bounds
-        
+        toView.alpha = 1
+
+        let dimmingView = UIView(frame: containerView.bounds)
+        dimmingView.backgroundColor = .black
+        dimmingView.alpha = 1
+
         containerView.insertSubview(toView, belowSubview: fromView)
-        containerView.addSubview(snapshot)
-        fromView.isHidden = true
-        
-        if isLandscapeFullscreen {
-            UIView.animate(
-                withDuration: animationDuration,
-                delay: 0,
-                options: [.curveEaseInOut]
-            ) {
-                let angle: CGFloat
-                switch self.fullscreenOrientationMask {
-                case .landscapeLeft:
-                    angle = .pi / 2
-                default:
-                    angle = -.pi / 2
-                }
-                let rotation = CGAffineTransform(rotationAngle: angle)
-                snapshot.transform = rotation
-                snapshot.alpha = 0
-            } completion: { finished in
-                fromView.isHidden = false
-                snapshot.removeFromSuperview()
-                transitionContext.completeTransition(finished && !transitionContext.transitionWasCancelled)
-            }
+        containerView.insertSubview(dimmingView, belowSubview: fromView)
+
+        UIView.animate(
+            withDuration: animationDuration,
+            delay: 0,
+            options: [.curveEaseIn, .beginFromCurrentState]
+        ) {
+            dimmingView.alpha = 0
+            fromView.alpha = 0
+            fromView.transform = CGAffineTransform(scaleX: 0.985, y: 0.985)
+        } completion: { finished in
+            dimmingView.removeFromSuperview()
+            fromView.alpha = 1
+            fromView.transform = .identity
+            transitionContext.completeTransition(finished && !transitionContext.transitionWasCancelled)
         }
     }
 }
