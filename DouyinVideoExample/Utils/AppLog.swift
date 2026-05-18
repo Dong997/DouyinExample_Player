@@ -43,4 +43,7 @@ public enum AppLog {
 
     /// 网络模块日志
     public static let network = Logger(subsystem: subsystem, category: "Network")
+
+    /// 临时闪烁问题排查日志
+    public static let flicker = Logger(subsystem: subsystem, category: "FlickerTrace")
 }

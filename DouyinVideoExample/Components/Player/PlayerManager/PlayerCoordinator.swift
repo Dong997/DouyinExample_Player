@@ -168,10 +168,13 @@ class PlayerCoordinator: NSObject {
     ///   - videos: 完整视频列表（用于预加载播放器管理）
     func playVideo(at indexPath: IndexPath, video: VideoModel, containerView: UIView, videos: [VideoModel]) {
         let index = indexPath.item
-        AppLog.player.info("Coordinator playVideo begin index=\(index), currentIndex=\(String(describing: self.currentPlayingIndexPath)), currentPlayerState=\(String(describing: self.currentPlayer.state)), url=\(video.videoURL.lastPathComponent)")
+        AppLog.flicker.info("[FlickerTrace] Coordinator playVideo begin index=\(index), currentIndex=\(String(describing: self.currentPlayingIndexPath)), currentPlayer=\(self.playerIdentity(self.currentPlayer)), currentPlayerState=\(String(describing: self.currentPlayer.state)), currentContainerSet=\(self.currentPlayer.containerView != nil), targetContainer=\(String(ObjectIdentifier(containerView).hashValue, radix: 16)), url=\(video.videoURL.lastPathComponent)")
 
         // 双播放器交替策略：先暂停上一次延迟暂停的旧播放器（快速连续滑动场景）
-        pendingPausePlayer?.pause()
+        if let pendingPausePlayer = pendingPausePlayer {
+            AppLog.flicker.info("[FlickerTrace] Coordinator pause previous pending player before switch player=\(self.playerIdentity(pendingPausePlayer)), state=\(String(describing: pendingPausePlayer.state))")
+            pendingPausePlayer.pause()
+        }
         pendingPausePlayer = nil
 
         // 记录旧播放器引用，但不立即暂停 —— 等新播放器启动后再停旧
@@ -190,28 +193,29 @@ class PlayerCoordinator: NSObject {
         let player: DYVideoPlayer
         if let existing = playerMap[index] {
             player = existing
-            AppLog.player.info("Coordinator use existing player index=\(index), state=\(String(describing: player.state)), currentURL=\(String(describing: player.currentURL?.absoluteString))")
+            AppLog.flicker.info("[FlickerTrace] Coordinator use existing player index=\(index), player=\(self.playerIdentity(player)), state=\(String(describing: player.state)), currentURL=\(String(describing: player.currentURL?.absoluteString)), readyForDisplay=\(player.isReadyForDisplay), preloadedReady=\(player.isPreloadedAndReady)")
         } else if let cached = takeFromRecentlyPlayedCache(index: index) {
             // 缓存命中：播放器已加载该视频，直接复用（回滑快速恢复）
             player = cached
             playerMap[index] = player
-            AppLog.player.info("Coordinator use recently cached player index=\(index), state=\(String(describing: player.state)), currentURL=\(String(describing: player.currentURL?.absoluteString))")
+            AppLog.flicker.info("[FlickerTrace] Coordinator use recently cached player index=\(index), player=\(self.playerIdentity(player)), state=\(String(describing: player.state)), currentURL=\(String(describing: player.currentURL?.absoluteString)), readyForDisplay=\(player.isReadyForDisplay), preloadedReady=\(player.isPreloadedAndReady)")
         } else if let acquired = playback.acquirePreloadPlayer() {
             // 池可能回收了 recentlyPlayedCache 中的播放器，清理悬垂引用防止后续误杀
             removeStaleCacheEntries(for: acquired)
             player = acquired
             playerMap[index] = player
-            AppLog.player.info("Coordinator acquired pool player index=\(index), state=\(String(describing: player.state))")
+            AppLog.flicker.info("[FlickerTrace] Coordinator acquired pool player index=\(index), player=\(self.playerIdentity(player)), state=\(String(describing: player.state)), readyForDisplay=\(player.isReadyForDisplay), preloadedReady=\(player.isPreloadedAndReady)")
         } else {
             player = currentPlayer
             playerMap[index] = player
-            AppLog.player.warning("Coordinator fallback to currentPlayer index=\(index), state=\(String(describing: player.state))")
+            AppLog.flicker.warning("[FlickerTrace] Coordinator fallback to currentPlayer index=\(index), player=\(self.playerIdentity(player)), state=\(String(describing: player.state)), readyForDisplay=\(player.isReadyForDisplay), preloadedReady=\(player.isPreloadedAndReady)")
         }
 
         playback.promoteToCurrent(player)
         player.multicastDelegate.add(self)
 
         if player.isPlaying(url: video.videoURL), player.containerView !== containerView {
+            AppLog.flicker.info("[FlickerTrace] Coordinator update container before play index=\(index), player=\(self.playerIdentity(player)), oldContainerSet=\(player.containerView != nil), targetContainer=\(String(ObjectIdentifier(containerView).hashValue, radix: 16))")
             player.updateContainer(containerView)
         }
 
@@ -219,8 +223,12 @@ class PlayerCoordinator: NSObject {
         // 同一实例复用时 play() 内部会 stop() 旧资源，无需延迟
         let isSeamlessSwitch = previousPlayer != nil && previousPlayer !== player
         if isSeamlessSwitch {
+            AppLog.flicker.info("[FlickerTrace] Coordinator defer previous pause previousIndex=\(String(describing: previousIndex)), oldPlayer=\(previousPlayer.map { self.playerIdentity($0) } ?? "nil"), newPlayer=\(self.playerIdentity(player))")
             pendingPausePlayer = previousPlayer
         } else {
+            if let previousPlayer = previousPlayer {
+                AppLog.flicker.info("[FlickerTrace] Coordinator immediate previous pause previousIndex=\(String(describing: previousIndex)), oldPlayer=\(self.playerIdentity(previousPlayer)), newPlayer=\(self.playerIdentity(player))")
+            }
             previousPlayer?.pause()
         }
 
@@ -236,6 +244,7 @@ class PlayerCoordinator: NSObject {
         // 预加载就绪的播放器已渲染首帧，attach 后画面立即可见
         // 此时可以安全地立即暂停旧播放器（新画面已展示，不会黑屏）
         if isSeamlessSwitch, player.isPreloadedAndReady {
+            AppLog.flicker.info("[FlickerTrace] Coordinator preloaded player ready, pause pending immediately index=\(index), player=\(self.playerIdentity(player))")
             pendingPausePlayer?.pause()
             pendingPausePlayer = nil
         }
@@ -525,6 +534,7 @@ class PlayerCoordinator: NSObject {
     /// - Returns: 如果有预加载播放器返回该播放器，否则返回 nil
     func bindPreloadedPlayerIfNeeded(at index: Int, containerView: UIView, video: VideoModel) -> DYVideoPlayer? {
         guard let player = playerMap[index] else { return nil }
+        AppLog.flicker.info("[FlickerTrace] Coordinator bindPreloadedIfNeeded index=\(index), player=\(self.playerIdentity(player)), state=\(String(describing: player.state)), isPlayingURL=\(player.isPlaying(url: video.videoURL)), readyForDisplay=\(player.isReadyForDisplay), preloadedReady=\(player.isPreloadedAndReady), currentContainerSet=\(player.containerView != nil), targetContainer=\(String(ObjectIdentifier(containerView).hashValue, radix: 16))")
         if player.isPlaying(url: video.videoURL), player.containerView !== containerView {
             player.updateContainer(containerView)
         }
@@ -534,10 +544,12 @@ class PlayerCoordinator: NSObject {
     /// 当 Cell 结束显示时，如果是当前播放的视频则暂停
     /// - Parameter indexPath: 视频位置
     func didEndDisplaying(at indexPath: IndexPath) {
+        AppLog.flicker.info("[FlickerTrace] Coordinator didEndDisplaying index=\(indexPath.item), currentIndex=\(String(describing: self.currentPlayingIndexPath)), currentPlayer=\(self.playerIdentity(self.currentPlayer)), currentState=\(String(describing: self.currentPlayer.state)), currentContainerSet=\(self.currentPlayer.containerView != nil)")
         if currentPlayingIndexPath == indexPath {
             pendingPlayerPreloadTask?.cancel()
             pendingPlayerPreloadTask = nil
             saveResumeTime(for: indexPath)
+            AppLog.flicker.info("[FlickerTrace] Coordinator didEndDisplaying pauses current index=\(indexPath.item), player=\(self.playerIdentity(self.currentPlayer))")
             currentPlayer.pause()
             pendingPausePlayer = nil
             currentPlayingIndexPath = nil

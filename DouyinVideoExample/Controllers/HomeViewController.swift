@@ -36,6 +36,9 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
     /// 避免通过 cellForItem(at:) 查找时因 Cell 未就绪/已回收导致封面图无法隐藏
     private weak var currentPlayingCell: VideoCell?
 
+    /// Home 内部假横屏全屏控制器，不触发 present 或系统方向旋转
+    private let inlineFullscreenController = InlineFullscreenVideoController()
+
     /// 导航协调器，由 HomeCoordinator 注入
     weak var coordinator: HomeCoordinator?
 
@@ -259,12 +262,12 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
         let video = viewModel.videos[index]
 
         currentPlayingCell = cell
-        AppLog.ui.info("Home playVideo begin index=\(index), url=\(video.videoURL.lastPathComponent), cellBounds=\(String(describing: cell.bounds)), containerBounds=\(String(describing: cell.playerContainerView.bounds))")
+        AppLog.flicker.info("[FlickerTrace] Home playVideo begin index=\(index), cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16)), url=\(video.videoURL.lastPathComponent), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath)), playerState=\(String(describing: self.viewModel.currentPlayer.state)), cellBounds=\(String(describing: cell.bounds)), containerBounds=\(String(describing: cell.playerContainerView.bounds))")
 
         viewModel.playVideo(at: indexPath, containerView: cell.playerContainerView)
 
         let player = viewModel.currentPlayer
-        AppLog.ui.info("Home playVideo requested index=\(index), playerState=\(String(describing: player.state)), playerURL=\(String(describing: player.currentURL?.absoluteString)), originalURL=\(String(describing: player.originalURL?.absoluteString))")
+        AppLog.flicker.info("[FlickerTrace] Home playVideo requested index=\(index), cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16)), playerState=\(String(describing: player.state)), playerURL=\(String(describing: player.currentURL?.absoluteString)), originalURL=\(String(describing: player.originalURL?.absoluteString)), playerContainerMatches=\(player.containerView === cell.playerContainerView)")
         if player.state == .playing, player.isPlaying(url: video.videoURL) {
             // 只有真正进入播放态后才隐藏占位图，避免 ready 但首帧未渲染时露黑。
             cell.hideCoverImage(animated: true)
@@ -378,23 +381,22 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
         guard viewModel.videos.indices.contains(indexPath.item) else { return }
         guard let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
         let video = viewModel.videos[indexPath.item]
-        let currentTime = viewModel.currentPlayer.currentTime
         let aspectRatio = video.aspectRatio ?? 1.0
         let fullscreenOrientationMask: UIInterfaceOrientationMask = aspectRatio > 1.0 ? .landscapeRight : .portrait
 
-        coordinator?.presentFullscreen(
-            videoURL: video.videoURL,
-            currentTime: currentTime,
-            aspectRatio: video.aspectRatio,
-            orientationMask: fullscreenOrientationMask,
-            player: viewModel.currentPlayer,
-            originView: cell.playerContainerView,
-            onDismiss: { [weak self] in
-                guard let self = self else { return }
-                self.bottomBar.isHidden = false
-                self.collectionView.isHidden = false
-                self.restoreAfterFullscreen(at: indexPath)
+        cell.controlView.updateFullscreenState(isFullScreen: true)
+        inlineFullscreenController.onDismiss = { [weak self] in
+            guard let self else { return }
+            if let restoredCell = self.collectionView.cellForItem(at: indexPath) as? VideoCell {
+                restoredCell.controlView.delegate = self
+                restoredCell.controlView.updateFullscreenState(isFullScreen: false)
+                restoredCell.controlView.updateCenterBtnState(.playing)
             }
+        }
+        inlineFullscreenController.enter(
+            from: cell.playerContainerView,
+            player: viewModel.currentPlayer,
+            orientationMask: fullscreenOrientationMask
         )
     }
 
@@ -429,12 +431,14 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
     /// 优先使用存储的 currentPlayingCell 弱引用，避免 cellForItem(at:) 找不到 Cell
     private func fadeOutCoverImage() {
         if let cell = currentPlayingCell {
+            AppLog.flicker.info("[FlickerTrace] Home fadeOutCoverImage using currentPlayingCell cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16)), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath))")
             cell.hideCoverImage(animated: true)
             return
         }
         // 兜底：弱引用失效时回退到 cellForItem(at:) 查找
         guard let indexPath = viewModel.currentPlayingIndexPath,
               let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
+        AppLog.flicker.info("[FlickerTrace] Home fadeOutCoverImage fallback index=\(indexPath.item), cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16))")
         cell.hideCoverImage(animated: true)
     }
 
@@ -475,13 +479,16 @@ extension HomeViewController: UICollectionViewDelegate, UICollectionViewDataSour
         let cell = collectionView.dequeueReusableCell(withReuseIdentifier: VideoCell.identifier, for: indexPath) as! VideoCell
         let video = viewModel.videos[indexPath.item]
         cell.configure(with: video)
+        AppLog.flicker.info("[FlickerTrace] Home cellForItem index=\(indexPath.item), cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16))")
         return cell
     }
 
     func collectionView(_ collectionView: UICollectionView, willDisplay cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
         guard let videoCell = cell as? VideoCell else { return }
         let index = indexPath.item
+        AppLog.flicker.info("[FlickerTrace] Home willDisplay index=\(index), cell=\(String(ObjectIdentifier(videoCell).hashValue, radix: 16)), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath)), playerState=\(String(describing: self.viewModel.currentPlayer.state)), contentOffset=\(String(describing: collectionView.contentOffset))")
         if let player = viewModel.bindPreloadedPlayerIfNeeded(at: index, containerView: videoCell.playerContainerView) {
+            AppLog.flicker.info("[FlickerTrace] Home willDisplay bound preloaded index=\(index), cell=\(String(ObjectIdentifier(videoCell).hashValue, radix: 16)), playerState=\(String(describing: player.state)), readyForDisplay=\(player.isReadyForDisplay), preloadedReady=\(player.isPreloadedAndReady), containerMatches=\(player.containerView === videoCell.playerContainerView)")
             if player.state == .paused || player.state == .idle {
                 videoCell.controlView.updateCenterBtnState(.preparing)
             }
@@ -503,16 +510,19 @@ extension HomeViewController: UICollectionViewDelegate, UICollectionViewDataSour
     }
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        AppLog.flicker.info("[FlickerTrace] Home scrollViewDidEndDecelerating offset=\(String(describing: scrollView.contentOffset)), visible=\(self.collectionView.indexPathsForVisibleItems.map(\.item).sorted())")
         scheduleVisibleCenterPlayback(reason: "didEndDecelerating")
     }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        AppLog.flicker.info("[FlickerTrace] Home scrollViewDidEndDragging decelerate=\(decelerate), offset=\(String(describing: scrollView.contentOffset)), visible=\(self.collectionView.indexPathsForVisibleItems.map(\.item).sorted())")
         if !decelerate {
             scheduleVisibleCenterPlayback(reason: "didEndDragging")
         }
     }
 
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        AppLog.flicker.info("[FlickerTrace] Home scrollViewDidEndScrollingAnimation offset=\(String(describing: scrollView.contentOffset)), visible=\(self.collectionView.indexPathsForVisibleItems.map(\.item).sorted())")
         scheduleVisibleCenterPlayback(reason: "didEndScrollingAnimation")
     }
 
@@ -533,6 +543,7 @@ extension HomeViewController: UICollectionViewDelegate, UICollectionViewDataSour
     }
 
     func collectionView(_ collectionView: UICollectionView, didEndDisplaying cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
+        AppLog.flicker.info("[FlickerTrace] Home didEndDisplaying index=\(indexPath.item), cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16)), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath)), playerState=\(String(describing: self.viewModel.currentPlayer.state))")
         viewModel.didEndDisplaying(at: indexPath)
     }
 }

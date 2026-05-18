@@ -26,11 +26,13 @@ public class DYPlayerView: UIView {
     
     public override init(frame: CGRect) {
         super.init(frame: frame)
-        backgroundColor = .black // 默认黑色背景
+        backgroundColor = .clear
+        playerLayer.backgroundColor = UIColor.clear.cgColor
     }
     
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-        backgroundColor = .black
+        backgroundColor = .clear
+        playerLayer.backgroundColor = UIColor.clear.cgColor
     }
 }

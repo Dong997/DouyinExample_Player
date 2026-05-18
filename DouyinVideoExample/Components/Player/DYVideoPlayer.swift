@@ -203,6 +203,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         assertMainThread()
         if currentURL == url { return }
 
+        AppLog.flicker.info("[FlickerTrace] DYVideoPlayer prepare begin player=\(self.debugIdentity), url=\(url.lastPathComponent), oldURL=\(String(describing: self.currentURL?.lastPathComponent)), state=\(String(describing: self.state)), containerSet=\(self.containerView != nil)")
         cleanupPlayerResources(resetState: true)
 
         self.currentURL = url
@@ -215,6 +216,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 重置播放器状态以便复用
     public func reset() {
         assertMainThread()
+        AppLog.flicker.info("[FlickerTrace] DYVideoPlayer reset player=\(self.debugIdentity), state=\(String(describing: self.state)), url=\(String(describing: self.currentURL?.lastPathComponent)), containerSet=\(self.containerView != nil)")
         preferredForwardBufferFraction = nil
         cleanupPlayerResources(resetState: true)
         containerView = nil
@@ -225,6 +227,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
 
     public func play(url: URL, originalURL: URL? = nil, in view: UIView, seekTo: TimeInterval? = nil) {
         assertMainThread()
+        AppLog.flicker.info("[FlickerTrace] DYVideoPlayer play begin player=\(self.debugIdentity), url=\(url.lastPathComponent), currentURL=\(String(describing: self.currentURL?.lastPathComponent)), sameURL=\(self.currentURL == url), state=\(String(describing: self.state)), oldContainerSet=\(self.containerView != nil), targetContainer=\(String(ObjectIdentifier(view).hashValue, radix: 16)), seek=\(String(describing: seekTo))")
 
         if currentURL == url, player != nil {
             updateContainer(view)
@@ -258,6 +261,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         playerView.isHidden = false
         updateState(.preparing)
         containerView = view
+        AppLog.flicker.info("[FlickerTrace] DYVideoPlayer play attached player=\(self.debugIdentity), targetContainer=\(String(ObjectIdentifier(view).hashValue, radix: 16)), previousContainerSet=\(previousContainer != nil)")
         if previousContainer !== view {
             multicastDelegate.player(self, didChangeContainerFrom: previousContainer, to: view)
         }
@@ -287,6 +291,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 暂停播放（保留当前进度）
     public func pause() {
         assertMainThread()
+        AppLog.flicker.info("[FlickerTrace] DYVideoPlayer pause player=\(self.debugIdentity), stateBefore=\(String(describing: self.state)), url=\(String(describing: self.currentURL?.lastPathComponent)), containerSet=\(self.containerView != nil)")
         player?.pause()
         updateState(.paused)
     }
@@ -295,6 +300,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 会重置状态为 idle，移除 layer 和观察者
     public func stop() {
         assertMainThread()
+        AppLog.flicker.info("[FlickerTrace] DYVideoPlayer stop player=\(self.debugIdentity), stateBefore=\(String(describing: self.state)), url=\(String(describing: self.currentURL?.lastPathComponent)), containerSet=\(self.containerView != nil)")
         cleanupPlayerResources(resetState: true)
     }
     
@@ -333,6 +339,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     public func updateContainer(_ view: UIView) {
         assertMainThread()
         let previousContainer = containerView
+        AppLog.flicker.info("[FlickerTrace] DYVideoPlayer updateContainer begin player=\(self.debugIdentity), state=\(String(describing: self.state)), url=\(String(describing: self.currentURL?.lastPathComponent)), previousContainerSet=\(previousContainer != nil), targetContainer=\(String(ObjectIdentifier(view).hashValue, radix: 16)), alreadyInTarget=\(self.playerView.superview == view)")
         
         // 确保 view 的布局已更新
         view.layoutIfNeeded()
@@ -527,6 +534,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         let work = { [weak self] in
             guard let self = self else { return }
             guard self.state != newState else { return }
+            AppLog.flicker.info("[FlickerTrace] DYVideoPlayer state player=\(self.debugIdentity), \(String(describing: self.state)) -> \(String(describing: newState)), url=\(String(describing: self.currentURL?.lastPathComponent)), containerSet=\(self.containerView != nil)")
             self.state = newState
             self.multicastDelegate.player(self, didChangeState: newState)
         }
@@ -540,6 +548,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 统一清理播放器资源和观察者的内部方法
     /// - Parameter resetState: 是否重置状态为 idle 并触发回调
     private func cleanupPlayerResources(resetState: Bool) {
+        AppLog.flicker.info("[FlickerTrace] DYVideoPlayer cleanup player=\(self.debugIdentity), resetState=\(resetState), state=\(String(describing: self.state)), url=\(String(describing: self.currentURL?.lastPathComponent)), containerSet=\(self.containerView != nil), playerViewSuperviewSet=\(self.playerView.superview != nil)")
         // 先移除所有监听
         removePlayerObservers()
         if isRenderingFirstFrame {
@@ -575,6 +584,10 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         case .aspectFill: return .resizeAspectFill
         case .resize: return .resize
         }
+    }
+
+    private var debugIdentity: String {
+        String(ObjectIdentifier(self).hashValue, radix: 16)
     }
     
     /// 根据当前 videoGravity 更新 playerLayer 的填充模式和 frame

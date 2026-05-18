@@ -33,4 +33,12 @@ class DYOrientationNavigationController: UINavigationController {
     override var shouldAutorotate: Bool {
         (topViewController as? DYOrientationConfigurable)?.dyShouldAutorotate ?? false
     }
+
+    override var childForStatusBarHidden: UIViewController? {
+        topViewController
+    }
+
+    override var childForStatusBarStyle: UIViewController? {
+        topViewController
+    }
 }
