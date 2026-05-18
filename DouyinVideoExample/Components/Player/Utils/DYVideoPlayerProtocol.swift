@@ -100,7 +100,7 @@ public protocol DYVideoPlayerDelegate: AnyObject {
     /// - Parameters:
     ///   - player: 播放器实例
     ///   - state: 新的状态
-    func player(_ player: DYVideoPlayer, didChangeState state: DYPlayerState)
+    func player(_ player: DYVideoPlayerSession, didChangeState state: DYPlayerState)
     
     /// 播放进度更新 (常用于更新进度条)
     /// - Parameters:
@@ -108,37 +108,37 @@ public protocol DYVideoPlayerDelegate: AnyObject {
     ///   - progress: 播放进度 (0.0 - 1.0)
     ///   - currentTime: 当前播放时间(秒)
     ///   - totalTime: 视频总时长(秒)
-    func player(_ player: DYVideoPlayer, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double)
+    func player(_ player: DYVideoPlayerSession, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double)
     
     /// 缓冲进度更新
     /// - Parameters:
     ///   - player: 播放器实例
     ///   - progress: 缓冲进度 (0.0 - 1.0)
-    func player(_ player: DYVideoPlayer, didUpdateBuffer progress: Double)
+    func player(_ player: DYVideoPlayerSession, didUpdateBuffer progress: Double)
     
     /// 播放出错
     /// - Parameters:
     ///   - player: 播放器实例
     ///   - error: 错误对象
-    func player(_ player: DYVideoPlayer, didFailWithError error: Error?)
+    func player(_ player: DYVideoPlayerSession, didFailWithError error: Error?)
     
     /// 视频播放完成 (如果是循环播放，每次循环结束都会调用)
-    func playerDidFinishPlaying(_ player: DYVideoPlayer)
+    func playerDidFinishPlaying(_ player: DYVideoPlayerSession)
     
     /// 视频尺寸信息回调 (可用于调整UI比例)
-    func player(_ player: DYVideoPlayer, didUpdateVideoSize size: CGSize)
+    func player(_ player: DYVideoPlayerSession, didUpdateVideoSize size: CGSize)
     
-    func player(_ player: DYVideoPlayer, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?)
+    func player(_ player: DYVideoPlayerSession, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?)
 }
 
 // MARK: - Optional Implementation
 public extension DYVideoPlayerDelegate {
-    func player(_ player: DYVideoPlayer, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double) {}
-    func player(_ player: DYVideoPlayer, didUpdateBuffer progress: Double) {}
-    func player(_ player: DYVideoPlayer, didFailWithError error: Error?) {}
-    func playerDidFinishPlaying(_ player: DYVideoPlayer) {}
-    func player(_ player: DYVideoPlayer, didUpdateVideoSize size: CGSize) {}
-    func player(_ player: DYVideoPlayer, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?) {}
+    func player(_ player: DYVideoPlayerSession, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double) {}
+    func player(_ player: DYVideoPlayerSession, didUpdateBuffer progress: Double) {}
+    func player(_ player: DYVideoPlayerSession, didFailWithError error: Error?) {}
+    func playerDidFinishPlaying(_ player: DYVideoPlayerSession) {}
+    func player(_ player: DYVideoPlayerSession, didUpdateVideoSize size: CGSize) {}
+    func player(_ player: DYVideoPlayerSession, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?) {}
 }
 
 // MARK: - Player Interface Protocol
@@ -213,7 +213,7 @@ public protocol DYVideoAdvancedControlInput: DYVideoPlayerInput {
 
 /// 列表 / 详情等场景下需要在不同容器间迁移播放器 UI 时使用的能力。
 /// 由 `DYVideoPlayer` 实现，通过初始化参数注入，避免子页面直接访问全局 `DYPlayerManager`。
-public protocol DYVideoPlayerSession: DYVideoAdvancedControlInput {
+public protocol DYVideoPlayerSession: AnyObject, DYVideoAdvancedControlInput {
     var containerView: UIView? { get }
     var originalURL: URL? { get }
     var currentURL: URL? { get }

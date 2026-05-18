@@ -248,7 +248,10 @@ public class VideoCacheManager: NSObject {
         }
 
         let urlString = url.absoluteString
-        guard preloadLoaders[urlString] == nil else { return true }
+        guard preloadLoaders[urlString] == nil else {
+            AppLog.cache.debug("Preload already running: \(url.lastPathComponent), loaders=\(self.preloadLoaders.count)")
+            return true
+        }
 
         let rangeHeader = "bytes=0-\(length - 1)"
         let headers = ["Range": rangeHeader]
@@ -261,7 +264,7 @@ public class VideoCacheManager: NSObject {
         loader.delegate = self
         loader.prepare()
         preloadLoaders[urlString] = loader
-        AppLog.cache.debug("Start preloading: \(url.lastPathComponent)")
+        AppLog.cache.info("Start preloading: \(url.lastPathComponent), range=\(rangeHeader), activeLoaders=\(self.preloadLoaders.count)")
         return true
     }
 
@@ -278,6 +281,9 @@ public class VideoCacheManager: NSObject {
     public func cancelAllPreloads() {
         for loader in preloadLoaders.values {
             loader.close()
+        }
+        if !preloadLoaders.isEmpty {
+            AppLog.cache.info("Cancel all preloads: count=\(self.preloadLoaders.count)")
         }
         preloadLoaders.removeAll()
     }

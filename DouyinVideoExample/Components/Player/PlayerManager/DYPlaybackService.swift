@@ -39,7 +39,7 @@ public final class DYPlaybackService {
         pool.player
     }
 
-    public func configure(_ player: DYVideoPlayer) {
+    public func configure(_ player: DYVideoPlayerSession) {
         player.applyConfiguration(configuration)
     }
 
@@ -54,9 +54,9 @@ public final class DYPlaybackService {
         originalURL: URL,
         in view: UIView,
         seekTo: TimeInterval? = nil,
-        use targetPlayer: DYVideoPlayer? = nil
+        use targetPlayer: DYVideoPlayerSession? = nil
     ) {
-        let p = targetPlayer ?? player
+        let p: DYVideoPlayerSession = targetPlayer ?? player
         configure(p)
         let proxyURL = VideoCacheManager.shared.getProxyURL(for: originalURL)
         AppLog.player.info("PlaybackService playWithCache original=\(originalURL.absoluteString), resolved=\(proxyURL.absoluteString), isProxy=\(proxyURL != originalURL), seek=\(String(describing: seekTo)), playerState=\(String(describing: p.state))")

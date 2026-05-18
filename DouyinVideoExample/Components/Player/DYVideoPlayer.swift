@@ -124,11 +124,11 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     }
     
     public var duration: Double {
-        return playerItem?.duration.seconds ?? 0
+        return sanitizedSeconds(playerItem?.duration.seconds)
     }
     
     public var currentTime: Double {
-        return player?.currentTime().seconds ?? 0
+        return sanitizedSeconds(player?.currentTime().seconds)
     }
     
     // MARK: - Private Properties
@@ -202,7 +202,6 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     public func prepare(url: URL, originalURL: URL? = nil) {
         assertMainThread()
         if currentURL == url { return }
-        AppLog.player.info("DYVideoPlayer prepare url=\(url.absoluteString), original=\(String(describing: originalURL?.absoluteString)), state=\(String(describing: self.state))")
 
         cleanupPlayerResources(resetState: true)
 
@@ -226,10 +225,8 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
 
     public func play(url: URL, originalURL: URL? = nil, in view: UIView, seekTo: TimeInterval? = nil) {
         assertMainThread()
-        AppLog.player.info("DYVideoPlayer play called url=\(url.absoluteString), original=\(String(describing: originalURL?.absoluteString)), seek=\(String(describing: seekTo)), currentURL=\(String(describing: self.currentURL?.absoluteString)), state=\(String(describing: self.state)), hasPlayer=\(self.player != nil), viewBounds=\(String(describing: view.bounds))")
 
         if currentURL == url, player != nil {
-            AppLog.player.info("DYVideoPlayer play same URL, update container and resume")
             updateContainer(view)
 
             if let time = seekTo {
@@ -272,7 +269,6 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 如果当前状态是 finished，会从头开始播放
     public func resume() {
         assertMainThread()
-        AppLog.player.info("DYVideoPlayer resume state=\(String(describing: self.state)), hasPlayer=\(self.player != nil), currentURL=\(String(describing: self.currentURL?.absoluteString))")
         if state == .finished {
             seek(to: 0) { [weak self] _ in
                 if let player = self?.player {
@@ -291,7 +287,6 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 暂停播放（保留当前进度）
     public func pause() {
         assertMainThread()
-        AppLog.player.info("DYVideoPlayer pause state=\(String(describing: self.state)), currentURL=\(String(describing: self.currentURL?.absoluteString))")
         player?.pause()
         updateState(.paused)
     }
@@ -317,7 +312,8 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
             return
         }
         
-        let cmTime = CMTime(seconds: time, preferredTimescale: 600)
+        let targetTime = normalizedSeekTime(time)
+        let cmTime = CMTime(seconds: targetTime, preferredTimescale: 600)
         
         if isPrecise {
             player.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
@@ -419,7 +415,6 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     ///   - autoPlay: true 表示播放模式（play 调用），false 表示预加载模式（prepare 调用，初始暂停）
     private func loadAssetAndCreatePlayer(url: URL, autoPlay: Bool) {
         let requestID = UUID().uuidString
-        AppLog.player.info("DYVideoPlayer loadAsset begin id=\(requestID), url=\(url.absoluteString), autoPlay=\(autoPlay)")
 
         let asset = AVURLAsset(url: url)
         let initialItem = AVPlayerItem(asset: asset)
@@ -446,7 +441,6 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         playerView.player = player
         addPlayerObservers()
         schedulePreparationTimeout(for: url, requestID: requestID)
-        AppLog.player.info("DYVideoPlayer player created id=\(requestID), itemStatus=\(String(describing: self.playerItem?.status.rawValue)), timeControlStatus=\(player.timeControlStatus.rawValue), autoPlay=\(autoPlay)")
 
         asset.loadValuesAsynchronously(forKeys: ["tracks"]) { [weak self] in
             var error: NSError?
@@ -455,6 +449,13 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
                   let track = asset.tracks(withMediaType: .video).first else {
                 let message = error?.localizedDescription ?? "tracks not loaded"
                 AppLog.player.warning("DYVideoPlayer tracks load skipped id=\(requestID), status=\(tracksStatus.rawValue), error=\(message)")
+                DispatchQueue.main.async {
+                    guard let self = self, self.currentURL == url, self.state == .preparing else { return }
+                    self.preparationTimeoutWorkItem?.cancel()
+                    self.preparationTimeoutWorkItem = nil
+                    self.updateState(.error(message))
+                    self.multicastDelegate.player(self, didFailWithError: error)
+                }
                 return
             }
 
@@ -506,6 +507,19 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         let clamped = min(max(fraction, 0), 1)
         item.preferredForwardBufferDuration = max(1, total * clamped)
     }
+
+    private func sanitizedSeconds(_ seconds: Double?) -> Double {
+        guard let seconds = seconds, seconds.isFinite, seconds > 0 else { return 0 }
+        return seconds
+    }
+
+    private func normalizedSeekTime(_ time: TimeInterval) -> TimeInterval {
+        guard time.isFinite else { return 0 }
+        let nonNegativeTime = max(0, time)
+        let totalDuration = duration
+        guard totalDuration > 0 else { return nonNegativeTime }
+        return min(nonNegativeTime, totalDuration)
+    }
     
     /// 更新播放器状态，并在状态变化时通过 delegate 通知外部
     /// - Parameter newState: 新的状态
@@ -513,7 +527,6 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         let work = { [weak self] in
             guard let self = self else { return }
             guard self.state != newState else { return }
-            AppLog.player.info("DYVideoPlayer state \(String(describing: self.state)) -> \(String(describing: newState)), currentURL=\(String(describing: self.currentURL?.absoluteString))")
             self.state = newState
             self.multicastDelegate.player(self, didChangeState: newState)
         }
@@ -535,6 +548,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         preparationTimeoutWorkItem?.cancel()
         preparationTimeoutWorkItem = nil
         isRenderingFirstFrame = false
+        pendingSeekTime = nil
         playerItem = nil
         
         playerLooper?.disableLooping()
@@ -574,15 +588,22 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         
         // 1. 监听 currentItem 变化 (处理 Looper 切换 Item)
         currentItemObserver = player.observe(\.currentItem, options: [.initial, .new]) { [weak self] player, _ in
-            guard let self = self else { return }
-            // 更新 playerItem 属性，这会触发 didSet 并自动重新绑定 Item 级别的 Observer
-            self.playerItem = player.currentItem
+            let currentItem = player.currentItem
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.player === player else { return }
+                // 更新 playerItem 属性，这会触发 didSet 并自动重新绑定 Item 级别的 Observer
+                self.playerItem = currentItem
+            }
         }
         
         // 2. 监听 timeControlStatus (播放/暂停/卡顿) - iOS 10+
         if #available(iOS 10.0, *) {
             timeControlStatusObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
-                self?.handleTimeControlStatus(player.timeControlStatus)
+                let status = player.timeControlStatus
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self, self.player === player else { return }
+                    self.handleTimeControlStatus(status)
+                }
             }
             // 防御性检查：如果 timeControlStatus 在添加观察者前已变更（缓存命中快速就绪场景）
             if player.timeControlStatus == .playing {
@@ -604,16 +625,22 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 此时 KVO (.new) 不会触发，导致 handleStatusChange 永远不被调用、播放器无法自动播放
     private func addPlayerItemObservers(for item: AVPlayerItem?) {
         guard let item = item else { return }
-        AppLog.player.info("DYVideoPlayer add item observers status=\(item.status.rawValue), currentURL=\(String(describing: self.currentURL?.absoluteString))")
         
         // 1. 监听 status (准备状态)
         statusObserver = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-            self?.handleStatusChange(item.status)
+            let status = item.status
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.playerItem === item else { return }
+                self.handleStatusChange(status)
+            }
         }
         
         // 2. 监听 loadedTimeRanges (缓冲进度)
         bufferObserver = item.observe(\.loadedTimeRanges, options: [.new]) { [weak self] item, _ in
-            self?.handleBufferUpdate(item)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.playerItem === item else { return }
+                self.handleBufferUpdate(item)
+            }
         }
         
         // 3. 监听播放结束通知
@@ -652,7 +679,6 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 处理 AVPlayerItem.status 变化
     /// - Parameter status: 最新的播放项状态
     private func handleStatusChange(_ status: AVPlayerItem.Status) {
-        AppLog.player.info("DYVideoPlayer item status=\(status.rawValue), state=\(String(describing: self.state)), hasContainer=\(self.containerView != nil), pendingSeek=\(String(describing: self.pendingSeekTime)), currentURL=\(String(describing: self.currentURL?.absoluteString))")
         switch status {
         case .readyToPlay:
             preparationTimeoutWorkItem?.cancel()
@@ -680,16 +706,12 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
                 } else {
                     // 如果处于暂停状态且不是预加载（有 container），则恢复播放
                     if state != .paused {
-                         AppLog.player.info("DYVideoPlayer readyToPlay -> play")
                          player?.play()
                          player?.rate = playbackRate
-                    } else {
-                         AppLog.player.warning("DYVideoPlayer readyToPlay has container but state is paused; skip auto play")
                     }
                     playerView.isHidden = false
                 }
             } else {
-                AppLog.player.info("DYVideoPlayer preload ready -> paused")
                 player?.pause()
                 player?.rate = 0
                 isRenderingFirstFrame = false
@@ -721,7 +743,6 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     /// 处理 AVPlayer.timeControlStatus 变化（播放、暂停、缓冲）
     /// - Parameter status: 播放控制状态
     private func handleTimeControlStatus(_ status: AVPlayer.TimeControlStatus) {
-        AppLog.player.info("DYVideoPlayer timeControlStatus=\(status.rawValue), state=\(String(describing: self.state)), renderingFirstFrame=\(self.isRenderingFirstFrame), currentURL=\(String(describing: self.currentURL?.absoluteString))")
         switch status {
         case .paused:
             if isRenderingFirstFrame { return }
@@ -765,12 +786,14 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         let bufferTime = start + duration
         let totalDuration = item.duration.seconds
         
-        if totalDuration > 0 {
-            let progress = bufferTime / totalDuration
-            DispatchQueue.main.async {
-                self.multicastDelegate.player(self, didUpdateBuffer: progress)
-            }
-        }
+        guard start.isFinite,
+              duration.isFinite,
+              bufferTime.isFinite,
+              totalDuration.isFinite,
+              totalDuration > 0 else { return }
+
+        let progress = min(max(bufferTime / totalDuration, 0), 1)
+        self.multicastDelegate.player(self, didUpdateBuffer: progress)
     }
     
     /// 处理播放进度更新
@@ -781,15 +804,19 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         let current = time.seconds
         let total = item.duration.seconds
         
-        if total > 0 {
-            let progress = current / total
-            self.multicastDelegate.player(self, didUpdateProgress: progress, currentTime: current, totalTime: total)
-        }
+        guard current.isFinite, total.isFinite, total > 0 else { return }
+        let progress = min(max(current / total, 0), 1)
+        self.multicastDelegate.player(self, didUpdateProgress: progress, currentTime: max(0, current), totalTime: total)
     }
     
     /// 播放完成回调（由通知触发）
     /// 负责更新状态、回调 delegate
     @objc private func playerDidFinishPlaying(_ notification: Notification) {
+        if !isLooping {
+            guard let finishedItem = notification.object as? AVPlayerItem,
+                  finishedItem === playerItem else { return }
+        }
+
         // 如果使用了 Looper，它会自动循环，不需要手动 Seek
         // 但我们仍然需要处理逻辑：比如在循环模式下不一定非要发送 finished 状态，或者只通知一次
         // 这里我们简单处理：如果是 Loop 模式，Looper 会自动重播，我们仅通知播放完成，不改变 state 为 finished (避免 UI 显示重播按钮)

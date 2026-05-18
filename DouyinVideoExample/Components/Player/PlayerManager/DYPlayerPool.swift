@@ -19,6 +19,15 @@ public final class DYPlayerPool {
     private var currentPlayer: DYVideoPlayer
     private var playerPool: [DYVideoPlayer] = []
 
+    /// 当前播放器池状态快照，便于排查预热播放器是否被复用、淘汰或提升为主播放器。
+    public var debugSnapshotDescription: String {
+        let entries = playerPool.map { player in
+            let marker = player === currentPlayer ? "*" : ""
+            return "\(marker)\(playerIdentity(player)):\(String(describing: player.state)):\(player.originalURL?.lastPathComponent ?? player.currentURL?.lastPathComponent ?? "nil")"
+        }
+        return "poolSize=\(playerPool.count)/\(maxPoolSize), entries=[" + entries.joined(separator: ",") + "]"
+    }
+
     public init(maxPoolSize: Int = 3) {
         precondition(maxPoolSize >= 1, "DYPlayerPool maxPoolSize must be >= 1")
         self.maxPoolSize = maxPoolSize
@@ -35,6 +44,7 @@ public final class DYPlayerPool {
         }) {
             idle.reset()
             markAsRecentlyUsed(idle)
+            AppLog.player.info("PlayerPool acquire idle player=\(self.playerIdentity(idle)), snapshot=\(self.debugSnapshotDescription)")
             return idle
         }
 
@@ -42,6 +52,7 @@ public final class DYPlayerPool {
             let newPlayer = DYVideoPlayer()
             newPlayer.isLooping = true
             playerPool.append(newPlayer)
+            AppLog.player.info("PlayerPool create preload player=\(self.playerIdentity(newPlayer)), snapshot=\(self.debugSnapshotDescription)")
             return newPlayer
         }
 
@@ -51,6 +62,7 @@ public final class DYPlayerPool {
             pausedVictim.stop()
             pausedVictim.reset()
             markAsRecentlyUsed(pausedVictim)
+            AppLog.player.info("PlayerPool recycle paused player=\(self.playerIdentity(pausedVictim)), snapshot=\(self.debugSnapshotDescription)")
             return pausedVictim
         }
 
@@ -58,10 +70,12 @@ public final class DYPlayerPool {
             victim.stop()
             victim.reset()
             markAsRecentlyUsed(victim)
+            AppLog.player.info("PlayerPool recycle fallback player=\(self.playerIdentity(victim)), snapshot=\(self.debugSnapshotDescription)")
             return victim
         }
 
         // 无法提供与 `currentPlayer` 分离的实例；勿用于「并行预加载另一条 index」。
+        AppLog.player.warning("PlayerPool acquire failed, snapshot=\(self.debugSnapshotDescription)")
         return nil
     }
 
@@ -76,6 +90,7 @@ public final class DYPlayerPool {
         if player !== currentPlayer {
             currentPlayer = player
             markAsRecentlyUsed(player)
+            AppLog.player.info("PlayerPool promote current player=\(self.playerIdentity(player)), snapshot=\(self.debugSnapshotDescription)")
         }
     }
 
@@ -109,5 +124,9 @@ public final class DYPlayerPool {
     private func isErrorState(_ state: DYPlayerState) -> Bool {
         if case .error = state { return true }
         return false
+    }
+
+    private func playerIdentity(_ player: DYVideoPlayer) -> String {
+        String(ObjectIdentifier(player).hashValue, radix: 16)
     }
 }

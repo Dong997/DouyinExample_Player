@@ -44,31 +44,31 @@ public class DYVideoPlayerMulticastDelegate: DYVideoPlayerDelegate {
 
     // MARK: - DYVideoPlayerDelegate
 
-    public func player(_ player: DYVideoPlayer, didChangeState state: DYPlayerState) {
+    public func player(_ player: DYVideoPlayerSession, didChangeState state: DYPlayerState) {
         forEach { $0.player(player, didChangeState: state) }
     }
 
-    public func player(_ player: DYVideoPlayer, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double) {
+    public func player(_ player: DYVideoPlayerSession, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double) {
         forEach { $0.player(player, didUpdateProgress: progress, currentTime: currentTime, totalTime: totalTime) }
     }
 
-    public func player(_ player: DYVideoPlayer, didUpdateBuffer progress: Double) {
+    public func player(_ player: DYVideoPlayerSession, didUpdateBuffer progress: Double) {
         forEach { $0.player(player, didUpdateBuffer: progress) }
     }
 
-    public func player(_ player: DYVideoPlayer, didFailWithError error: Error?) {
+    public func player(_ player: DYVideoPlayerSession, didFailWithError error: Error?) {
         forEach { $0.player(player, didFailWithError: error) }
     }
 
-    public func playerDidFinishPlaying(_ player: DYVideoPlayer) {
+    public func playerDidFinishPlaying(_ player: DYVideoPlayerSession) {
         forEach { $0.playerDidFinishPlaying(player) }
     }
 
-    public func player(_ player: DYVideoPlayer, didUpdateVideoSize size: CGSize) {
+    public func player(_ player: DYVideoPlayerSession, didUpdateVideoSize size: CGSize) {
         forEach { $0.player(player, didUpdateVideoSize: size) }
     }
 
-    public func player(_ player: DYVideoPlayer, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?) {
+    public func player(_ player: DYVideoPlayerSession, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?) {
         forEach { $0.player(player, didChangeContainerFrom: oldContainer, to: newContainer) }
     }
 

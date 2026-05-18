@@ -12,6 +12,33 @@ import os.log
 @MainActor
 public class VideoPreloadManager {
 
+    /// 当前字节级预加载状态快照，便于调试预加载窗口、并发任务和命中率。
+    public struct DebugSnapshot: CustomStringConvertible {
+        public let preloadNextCount: Int
+        public let preloadPreviousCount: Int
+        public let preloadSize: Int
+        public let maxConcurrentPreloads: Int
+        public let allURLCount: Int
+        public let lastResolvedIndex: Int?
+        public let preloadingURLs: [URL]
+        public let runningPreloads: [URL]
+        public let priorityOrder: [URL]
+        public let totalPreloadRequests: Int
+        public let totalPreloadCompleted: Int
+        public let totalPreloadFailed: Int
+        public let totalPreloadHits: Int
+        public let cacheHitRate: Double
+        public let preloadSuccessRate: Double
+
+        public var description: String {
+            "window=\(shortList(preloadingURLs)), running=\(shortList(runningPreloads)), priority=\(shortList(priorityOrder)), size=\(preloadSize), currentIndex=\(String(describing: lastResolvedIndex)), requests=\(totalPreloadRequests), completed=\(totalPreloadCompleted), failed=\(totalPreloadFailed), hits=\(totalPreloadHits), hitRate=\(String(format: "%.2f", cacheHitRate)), successRate=\(String(format: "%.2f", preloadSuccessRate))"
+        }
+
+        private func shortList(_ urls: [URL]) -> String {
+            "[" + urls.map { $0.lastPathComponent }.joined(separator: ",") + "]"
+        }
+    }
+
     /// 全局单例访问入口（与 `VideoCacheManager.shared` 配对，兼容未走组合根的代码路径）
     public static let shared = VideoPreloadManager(cache: VideoCacheManager.shared)
 
@@ -80,6 +107,26 @@ public class VideoPreloadManager {
         return Double(totalPreloadFailed) / Double(totalPreloadRequests)
     }
 
+    public var debugSnapshot: DebugSnapshot {
+        DebugSnapshot(
+            preloadNextCount: preloadNextCount,
+            preloadPreviousCount: preloadPreviousCount,
+            preloadSize: preloadSize,
+            maxConcurrentPreloads: maxConcurrentPreloads,
+            allURLCount: currentAllURLs.count,
+            lastResolvedIndex: lastResolvedIndex,
+            preloadingURLs: Array(preloadingUrls),
+            runningPreloads: Array(runningPreloads),
+            priorityOrder: preloadURLPriorityOrder,
+            totalPreloadRequests: totalPreloadRequests,
+            totalPreloadCompleted: totalPreloadCompleted,
+            totalPreloadFailed: totalPreloadFailed,
+            totalPreloadHits: totalPreloadHits,
+            cacheHitRate: cacheHitRate,
+            preloadSuccessRate: preloadSuccessRate
+        )
+    }
+
     private let cache: VideoCacheManager
     private let notificationCenter: NotificationCenter
 
@@ -115,6 +162,7 @@ public class VideoPreloadManager {
     ///   - currentIndex: 当前播放项在列表中的位置；传入后优先用于处理重复 URL 场景
     public func updateStrategy(currentURL: URL?, allURLs: [URL], currentIndex: Int? = nil) {
         debounceWorkItem?.cancel()
+        AppLog.preload.debug("Preload update requested currentIndex=\(String(describing: currentIndex)), current=\(currentURL?.lastPathComponent ?? "nil"), allCount=\(allURLs.count)")
 
         debounceWorkItem = Task { [weak self] in
             try? await Task.sleep(nanoseconds: self?.debounceIntervalNanos ?? 150_000_000)
@@ -187,6 +235,11 @@ public class VideoPreloadManager {
 
         self.preloadingUrls = urlSet
         self.preloadURLPriorityOrder = orderedPreloadURLs
+        #if DEBUG
+        AppLog.preload.info("Preload window resolved currentIndex=\(String(describing: resolvedCurrentIndex)), current=\(currentURL?.lastPathComponent ?? "nil"), window=\(self.shortURLList(orderedPreloadURLs)), new=\(self.shortURLList(Array(newInWindow))), snapshot=\(self.debugSnapshot.description)")
+        #else
+        AppLog.preload.info("Preload window resolved currentIndex=\(String(describing: resolvedCurrentIndex)), current=\(currentURL?.lastPathComponent ?? "nil"), window=\(self.shortURLList(orderedPreloadURLs)), new=\(self.shortURLList(Array(newInWindow)))")
+        #endif
         self.schedulePreloads()
     }
 
@@ -223,6 +276,11 @@ public class VideoPreloadManager {
         for url in toCancel {
             cache.cancelPreload(for: url)
             runningPreloads.remove(url)
+            #if DEBUG
+            AppLog.preload.info("Preload cancel outOfWindow url=\(url.lastPathComponent), snapshot=\(self.debugSnapshot.description)")
+            #else
+            AppLog.preload.info("Preload cancel outOfWindow url=\(url.lastPathComponent)")
+            #endif
         }
 
         let candidates = preloadURLPriorityOrder.filter { url in
@@ -230,6 +288,8 @@ public class VideoPreloadManager {
             !runningPreloads.contains(url) &&
             !isCacheReadyForCurrentPreload(url)
         }
+
+        AppLog.preload.debug("Preload schedule candidates=\(self.shortURLList(candidates)), running=\(self.shortURLList(Array(self.runningPreloads))), maxConcurrent=\(self.maxConcurrentPreloads)")
 
         for url in candidates {
             if runningPreloads.count >= maxConcurrentPreloads {
@@ -239,6 +299,7 @@ public class VideoPreloadManager {
             if cache.preload(url: url, length: preloadSize) {
                 totalPreloadRequests += 1
                 runningPreloads.insert(url)
+                AppLog.preload.info("Preload start url=\(url.lastPathComponent), size=\(self.preloadSize), running=\(self.shortURLList(Array(self.runningPreloads)))")
             }
         }
     }
@@ -256,6 +317,7 @@ public class VideoPreloadManager {
         currentAllURLs.removeAll()
         cacheReadinessSnapshots.removeAll()
         lastResolvedIndex = nil
+        AppLog.preload.info("Preload cancel all")
     }
 
     /// 清理所有磁盘缓存
@@ -311,6 +373,11 @@ public class VideoPreloadManager {
             if let userInfo = notification.userInfo, let url = userInfo["url"] as? URL {
                 self.runningPreloads.remove(url)
                 self.markCacheReadyForCurrentPreload(url)
+                #if DEBUG
+                AppLog.preload.info("Preload finished url=\(url.lastPathComponent), snapshot=\(self.debugSnapshot.description)")
+                #else
+                AppLog.preload.info("Preload finished url=\(url.lastPathComponent)")
+                #endif
             }
             self.schedulePreloads()
             self.checkAndAdjustPreloadSize()
@@ -325,6 +392,11 @@ public class VideoPreloadManager {
             if let userInfo = notification.userInfo, let url = userInfo["url"] as? URL {
                 self.runningPreloads.remove(url)
                 self.invalidateCacheReadinessSnapshot(for: url)
+                #if DEBUG
+                AppLog.preload.warning("Preload failed url=\(url.lastPathComponent), snapshot=\(self.debugSnapshot.description)")
+                #else
+                AppLog.preload.warning("Preload failed url=\(url.lastPathComponent)")
+                #endif
             }
             self.schedulePreloads()
             self.checkAndAdjustPreloadSize()
@@ -336,6 +408,10 @@ public class VideoPreloadManager {
         if recentPreloadOutcomes.count > adaptiveWindowSize {
             recentPreloadOutcomes.removeFirst(recentPreloadOutcomes.count - adaptiveWindowSize)
         }
+    }
+
+    private func shortURLList(_ urls: [URL]) -> String {
+        "[" + urls.map { $0.lastPathComponent }.joined(separator: ",") + "]"
     }
 
     /// 根据成功/失败率动态调整预加载大小

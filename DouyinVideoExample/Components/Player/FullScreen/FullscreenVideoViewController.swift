@@ -79,7 +79,7 @@ class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable
     /// 播放控制元素的总容器视图
     private let controlsContainerView = UIView()
     /// 当前控制层是否处于展示状态
-    private var areControlsVisible: Bool = true
+    private var areControlsVisible: Bool = false
     /// 控制层自动隐藏定时器
     private var controlsAutoHideTimer: Timer?
     /// 中间播放按钮的播放图标
@@ -166,7 +166,6 @@ class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable
         currentSpeed = playback.configuration.playbackRate
         updateSpeedButtonTitle()
         playVideo()
-        scheduleControlsAutoHide()
     }
 
     /// 视图即将显示，此处预留扩展
@@ -314,6 +313,8 @@ class FullscreenVideoViewController: UIViewController, DYOrientationConfigurable
             make.width.equalTo(168)
             make.height.equalTo(92)
         }
+
+        hideControls(animated: false)
     }
 
     private func updateCloseButtonLayout() {
@@ -631,11 +632,13 @@ extension FullscreenVideoViewController: DYVideoPlayerDelegate {
     /// - Parameters:
     ///   - player: 播放器实例
     ///   - state: 最新的播放器状态
-    func player(_ player: DYVideoPlayer, didChangeState state: DYPlayerState) {
+    func player(_ player: DYVideoPlayerSession, didChangeState state: DYPlayerState) {
         switch state {
         case .playing:
             updateCenterPlayButtonForPlayerState(state)
-            scheduleControlsAutoHide()
+            if areControlsVisible {
+                scheduleControlsAutoHide()
+            }
         case .paused:
             showControls(animated: true)
             cancelControlsAutoHide()
@@ -659,7 +662,7 @@ extension FullscreenVideoViewController: DYVideoPlayerDelegate {
     ///   - progress: 当前进度比值 0~1
     ///   - currentTime: 当前播放时间，单位秒
     ///   - totalTime: 总时长，单位秒
-    func player(_ player: DYVideoPlayer, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double) {
+    func player(_ player: DYVideoPlayerSession, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double) {
         if !isDraggingProgress {
             progressBar.updateProgress(to: CGFloat(progress))
             updateTimeLabel(currentTime: currentTime, totalTime: totalTime)
@@ -670,7 +673,7 @@ extension FullscreenVideoViewController: DYVideoPlayerDelegate {
     /// - Parameters:
     ///   - player: 播放器实例
     ///   - progress: 当前缓冲比值 0~1
-    func player(_ player: DYVideoPlayer, didUpdateBuffer progress: Double) {
+    func player(_ player: DYVideoPlayerSession, didUpdateBuffer progress: Double) {
         progressBar.updateBuffer(to: CGFloat(progress))
     }
 }

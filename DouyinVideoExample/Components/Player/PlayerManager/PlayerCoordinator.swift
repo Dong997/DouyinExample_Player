@@ -79,6 +79,12 @@ class PlayerCoordinator: NSObject {
     /// 最近播放缓存的最大容量（超出时淘汰最旧的，stop+reset 归还对象池）
     private let maxRecentlyPlayedCount = 2
 
+    /// 播放器级预热延迟任务。快速滑动时会被新的播放索引取消，只保留字节级预缓存。
+    private var pendingPlayerPreloadTask: Task<Void, Never>?
+
+    /// 当前播放稳定多久后再做 AVPlayer/AVPlayerItem 预热。
+    private let playerPreloadDelayNanos: UInt64 = 350_000_000
+
     /// 当前"主"播放器的便捷访问，通过注入的 playback 协议获取
     var currentPlayer: DYVideoPlayer {
         return playback.currentPlayer
@@ -137,6 +143,7 @@ class PlayerCoordinator: NSObject {
     }
 
     deinit {
+        pendingPlayerPreloadTask?.cancel()
         recentlyPlayedCache.forEach {
             $0.player.multicastDelegate.remove(self)
             $0.player.stop()
@@ -348,7 +355,8 @@ class PlayerCoordinator: NSObject {
     ///   - videos: 完整视频列表
     func managePreloadPlayers(currentIndex: Int, previousIndex: Int?, videos: [VideoModel]) {
         var keepIndices = Set([currentIndex])
-        if let predictedIndex = predictedPreloadIndex(currentIndex: currentIndex, previousIndex: previousIndex, videos: videos) {
+        let predictedIndex = predictedPreloadIndex(currentIndex: currentIndex, previousIndex: previousIndex, videos: videos)
+        if let predictedIndex = predictedIndex {
             keepIndices.insert(predictedIndex)
         }
 
@@ -361,6 +369,7 @@ class PlayerCoordinator: NSObject {
                     // 移入最近播放缓存而非 stop+reset，回滑时可直接复用
                     recentlyPlayedCache.removeAll { $0.index == key }
                     recentlyPlayedCache.append((index: key, player: p))
+                    AppLog.player.info("Coordinator move player to recentCache index=\(key), player=\(self.playerIdentity(p)), recent=\(self.recentCacheDebugDescription())")
                 }
             }
         }
@@ -368,9 +377,9 @@ class PlayerCoordinator: NSObject {
         // 淘汰超出容量的缓存条目，stop+reset 归还对象池
         trimRecentlyPlayedCache()
 
-        if let predictedIndex = predictedPreloadIndex(currentIndex: currentIndex, previousIndex: previousIndex, videos: videos) {
-            preloadVideo(at: predictedIndex, videos: videos)
-        }
+        AppLog.player.info("Coordinator preload policy currentIndex=\(currentIndex), previousIndex=\(String(describing: previousIndex)), predicted=\(String(describing: predictedIndex)), keep=\(self.indexSetDescription(keepIndices)), map=\(self.playerMapDebugDescription()), recent=\(self.recentCacheDebugDescription())")
+
+        schedulePlayerPreloadIfNeeded(predictedIndex: predictedIndex, currentIndex: currentIndex, videos: videos)
     }
 
     /// 根据播放索引变化推断下一次最可能进入的页面：下滑/首次播放预热后一条，上滑预热前一条。
@@ -387,6 +396,30 @@ class PlayerCoordinator: NSObject {
         return candidate
     }
 
+    private func schedulePlayerPreloadIfNeeded(predictedIndex: Int?, currentIndex: Int, videos: [VideoModel]) {
+        pendingPlayerPreloadTask?.cancel()
+
+        guard let predictedIndex = predictedIndex else {
+            AppLog.player.debug("Coordinator player preload skipped: no predicted index")
+            return
+        }
+
+        let snapshotVideos = videos
+        pendingPlayerPreloadTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: self?.playerPreloadDelayNanos ?? 350_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self = self,
+                      self.currentPlayingIndexPath?.item == currentIndex,
+                      snapshotVideos.indices.contains(predictedIndex) else { return }
+                AppLog.player.info("Coordinator delayed player preload fire currentIndex=\(currentIndex), predicted=\(predictedIndex)")
+                self.preloadVideo(at: predictedIndex, videos: snapshotVideos)
+                self.pendingPlayerPreloadTask = nil
+            }
+        }
+        AppLog.player.info("Coordinator delayed player preload scheduled currentIndex=\(currentIndex), predicted=\(predictedIndex)")
+    }
+
     /// 淘汰最近播放缓存中超出容量的旧条目
     /// 被淘汰的播放器执行 stop+reset，归还给 DYPlayerPool 作为空闲实例复用
     /// 安全检查：跳过仍在 playerMap 中或为 currentPlayer 的条目（防止悬垂引用导致误杀）
@@ -398,6 +431,7 @@ class PlayerCoordinator: NSObject {
                 // 播放器已被复用，从缓存中移除条目但不 stop（避免杀死在用播放器）
                 recentlyPlayedCache.remove(at: i)
             } else {
+                AppLog.player.info("Coordinator evict recentCache index=\(entry.index), player=\(self.playerIdentity(entry.player))")
                 entry.player.stop()
                 entry.player.reset()
                 recentlyPlayedCache.remove(at: i)
@@ -441,6 +475,7 @@ class PlayerCoordinator: NSObject {
         if let cached = takeFromRecentlyPlayedCache(index: index) {
             playerMap[index] = cached
             cached.multicastDelegate.add(self)
+            AppLog.player.info("Coordinator preload hit recentCache index=\(index), player=\(self.playerIdentity(cached)), map=\(self.playerMapDebugDescription())")
             return
         }
 
@@ -454,8 +489,32 @@ class PlayerCoordinator: NSObject {
         playerMap[index] = player
 
         let video = videos[index]
-        AppLog.player.info("Coordinator preload index=\(index), url=\(video.videoURL.lastPathComponent), playerState=\(String(describing: player.state))")
+        AppLog.player.info("Coordinator preload prepare index=\(index), url=\(video.videoURL.lastPathComponent), player=\(self.playerIdentity(player)), playerState=\(String(describing: player.state)), map=\(self.playerMapDebugDescription())")
         playback.preload(originalURL: video.videoURL, use: player)
+    }
+
+    private func playerMapDebugDescription() -> String {
+        let entries = playerMap.keys.sorted().compactMap { index -> String? in
+            guard let player = playerMap[index] else { return nil }
+            let marker = player === currentPlayer ? "*" : ""
+            return "\(index):\(marker)\(playerIdentity(player)):\(String(describing: player.state))"
+        }
+        return "[" + entries.joined(separator: ",") + "]"
+    }
+
+    private func recentCacheDebugDescription() -> String {
+        let entries = recentlyPlayedCache.map { entry in
+            "\(entry.index):\(playerIdentity(entry.player)):\(String(describing: entry.player.state))"
+        }
+        return "[" + entries.joined(separator: ",") + "]"
+    }
+
+    private func indexSetDescription(_ indices: Set<Int>) -> String {
+        "[" + indices.sorted().map(String.init).joined(separator: ",") + "]"
+    }
+
+    private func playerIdentity(_ player: DYVideoPlayerSession) -> String {
+        String(ObjectIdentifier(player).hashValue, radix: 16)
     }
 
     /// 当 Cell 即将显示时，检查是否有已预加载的播放器需要绑定容器
@@ -476,6 +535,8 @@ class PlayerCoordinator: NSObject {
     /// - Parameter indexPath: 视频位置
     func didEndDisplaying(at indexPath: IndexPath) {
         if currentPlayingIndexPath == indexPath {
+            pendingPlayerPreloadTask?.cancel()
+            pendingPlayerPreloadTask = nil
             saveResumeTime(for: indexPath)
             currentPlayer.pause()
             pendingPausePlayer = nil
@@ -495,6 +556,8 @@ class PlayerCoordinator: NSObject {
 
     /// 停止并清理所有播放器
     func stopAll() {
+        pendingPlayerPreloadTask?.cancel()
+        pendingPlayerPreloadTask = nil
         pendingPausePlayer = nil
         recentlyPlayedCache.forEach { $0.player.stop(); $0.player.reset() }
         recentlyPlayedCache.removeAll()
@@ -513,7 +576,7 @@ class PlayerCoordinator: NSObject {
 
 extension PlayerCoordinator: DYVideoPlayerDelegate {
 
-    func player(_ player: DYVideoPlayer, didChangeState state: DYPlayerState) {
+    func player(_ player: DYVideoPlayerSession, didChangeState state: DYPlayerState) {
         AppLog.player.info("Coordinator didChangeState state=\(String(describing: state)), isCurrent=\(player === self.currentPlayer), currentIndex=\(String(describing: self.currentPlayingIndexPath)), playerURL=\(String(describing: player.currentURL?.absoluteString))")
         // 双播放器交替策略：新播放器进入 .playing 后，安全暂停旧播放器
         // 此时新画面已渲染，暂停旧播放器不会造成黑屏
@@ -525,17 +588,17 @@ extension PlayerCoordinator: DYVideoPlayerDelegate {
         eventPublisher.send(.stateChanged(state, indexPath))
     }
 
-    func player(_ player: DYVideoPlayer, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double) {
+    func player(_ player: DYVideoPlayerSession, didUpdateProgress progress: Double, currentTime: Double, totalTime: Double) {
         guard player === currentPlayer, let indexPath = currentPlayingIndexPath else { return }
         eventPublisher.send(.progressUpdated(progress: progress, currentTime: currentTime, totalTime: totalTime, indexPath))
     }
 
-    func player(_ player: DYVideoPlayer, didUpdateBuffer progress: Double) {
+    func player(_ player: DYVideoPlayerSession, didUpdateBuffer progress: Double) {
         guard player === currentPlayer, let indexPath = currentPlayingIndexPath else { return }
         eventPublisher.send(.bufferUpdated(progress, indexPath))
     }
 
-    func player(_ player: DYVideoPlayer, didFailWithError error: Error?) {
+    func player(_ player: DYVideoPlayerSession, didFailWithError error: Error?) {
         guard player === currentPlayer, let indexPath = currentPlayingIndexPath else { return }
         AppLog.player.error("Playback failed at index \(indexPath.item): \(String(describing: error))")
 
@@ -565,15 +628,15 @@ extension PlayerCoordinator: DYVideoPlayerDelegate {
         eventPublisher.send(.error(error, indexPath))
     }
 
-    func playerDidFinishPlaying(_ player: DYVideoPlayer) {
+    func playerDidFinishPlaying(_ player: DYVideoPlayerSession) {
         guard player === currentPlayer, let indexPath = currentPlayingIndexPath else { return }
         eventPublisher.send(.finished(indexPath))
     }
 
-    func player(_ player: DYVideoPlayer, didUpdateVideoSize size: CGSize) {
+    func player(_ player: DYVideoPlayerSession, didUpdateVideoSize size: CGSize) {
         guard player === currentPlayer, let indexPath = currentPlayingIndexPath else { return }
         eventPublisher.send(.videoSizeChanged(size, indexPath))
     }
 
-    func player(_ player: DYVideoPlayer, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?) {}
+    func player(_ player: DYVideoPlayerSession, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?) {}
 }

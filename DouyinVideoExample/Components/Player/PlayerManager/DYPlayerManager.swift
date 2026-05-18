@@ -12,7 +12,7 @@ public protocol DYPlaybackCoordinating: AnyObject {
     func promoteToCurrent(_ player: DYVideoPlayer)
 
     func play(url: URL, in view: UIView, seekTo: TimeInterval?)
-    func playWithCache(originalURL: URL, in view: UIView, seekTo: TimeInterval?, use targetPlayer: DYVideoPlayer?)
+    func playWithCache(originalURL: URL, in view: UIView, seekTo: TimeInterval?, use targetPlayer: DYVideoPlayerSession?)
     func preload(originalURL: URL, use targetPlayer: DYVideoPlayer)
     func applyConfiguration(_ configuration: DYVideoPlayerConfiguration)
     func pause()
@@ -81,7 +81,7 @@ public final class DYPlayerManager {
         originalURL: URL,
         in view: UIView,
         seekTo: TimeInterval? = nil,
-        use targetPlayer: DYVideoPlayer? = nil
+        use targetPlayer: DYVideoPlayerSession? = nil
     ) {
         playback.playWithCache(originalURL: originalURL, in: view, seekTo: seekTo, use: targetPlayer)
     }
