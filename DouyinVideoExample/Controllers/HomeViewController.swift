@@ -35,6 +35,7 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
     /// 当前正在播放视频的 Cell 弱引用
     /// 避免通过 cellForItem(at:) 查找时因 Cell 未就绪/已回收导致封面图无法隐藏
     private weak var currentPlayingCell: VideoCell?
+    private var currentPlayingCellIndexPath: IndexPath?
 
     /// Home 内部假横屏全屏控制器，不触发 present 或系统方向旋转
     private let inlineFullscreenController = InlineFullscreenVideoController()
@@ -196,8 +197,8 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
     // MARK: - Binding
 
     private func bindViewModel() {
-        // 播放器开始播放时直接隐藏封面图（绕过 Combine receive(on:) 延迟）
-        viewModel.onPlayerStartPlaying = { [weak self] in
+        // 播放器首帧可显示时直接隐藏封面图（绕过 Combine receive(on:) 延迟）
+        viewModel.onPlayerReadyForDisplay = { [weak self] in
             self?.fadeOutCoverImage()
         }
 
@@ -223,7 +224,6 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
                     self?.hasPlayedFirstVideo = true
                     self?.centerPlaybackWorkItem?.cancel()
                     self?.centerPlaybackWorkItem = nil
-                    self?.fadeOutCoverImage()
                 }
             }
             .store(in: &cancellables)
@@ -262,6 +262,7 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
         let video = viewModel.videos[index]
 
         currentPlayingCell = cell
+        currentPlayingCellIndexPath = indexPath
         AppLog.flicker.info("[FlickerTrace] Home playVideo begin index=\(index), cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16)), url=\(video.videoURL.lastPathComponent), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath)), playerState=\(String(describing: self.viewModel.currentPlayer.state)), cellBounds=\(String(describing: cell.bounds)), containerBounds=\(String(describing: cell.playerContainerView.bounds))")
 
         let preboundPlayer = viewModel.bindPreloadedPlayerIfNeeded(at: index, containerView: cell.playerContainerView)
@@ -431,16 +432,33 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
 
     /// 播放器就绪后淡出封面图，实现「封面→视频画面」的无缝过渡
     /// 抖音做法：视频画面渲染后，封面图以 0.3s 动画淡出
-    /// 优先使用存储的 currentPlayingCell 弱引用，避免 cellForItem(at:) 找不到 Cell
+    /// 优先使用存储的 currentPlayingCell 弱引用，但必须确认它仍对应当前播放项。
+    /// 快速滑动时 cell 会被复用，播放器 .playing 回调也可能晚到；若不校验 index/container，
+    /// 旧 cell 弱引用会提前返回，导致真正播放中的 cell 封面没有被隐藏。
     private func fadeOutCoverImage() {
-        if let cell = currentPlayingCell {
-            AppLog.flicker.info("[FlickerTrace] Home fadeOutCoverImage using currentPlayingCell cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16)), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath))")
+        guard let indexPath = viewModel.currentPlayingIndexPath,
+              viewModel.videos.indices.contains(indexPath.item) else { return }
+
+        let player = viewModel.currentPlayer
+        let video = viewModel.videos[indexPath.item]
+
+        if let cell = currentPlayingCell,
+           currentPlayingCellIndexPath == indexPath,
+           collectionView.indexPath(for: cell) == indexPath,
+           player.containerView === cell.playerContainerView,
+           player.isPlaying(url: video.videoURL),
+           player.isReadyForDisplay {
+            AppLog.flicker.info("[FlickerTrace] Home fadeOutCoverImage using currentPlayingCell index=\(indexPath.item), cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16)), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath))")
             cell.hideCoverImage(animated: true)
             return
         }
         // 兜底：弱引用失效时回退到 cellForItem(at:) 查找
-        guard let indexPath = viewModel.currentPlayingIndexPath,
-              let cell = collectionView.cellForItem(at: indexPath) as? VideoCell else { return }
+        guard let cell = collectionView.cellForItem(at: indexPath) as? VideoCell,
+              player.containerView === cell.playerContainerView,
+              player.isPlaying(url: video.videoURL),
+              player.isReadyForDisplay else { return }
+        currentPlayingCell = cell
+        currentPlayingCellIndexPath = indexPath
         AppLog.flicker.info("[FlickerTrace] Home fadeOutCoverImage fallback index=\(indexPath.item), cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16))")
         cell.hideCoverImage(animated: true)
     }
@@ -552,6 +570,10 @@ extension HomeViewController: UICollectionViewDelegate, UICollectionViewDataSour
 
     func collectionView(_ collectionView: UICollectionView, didEndDisplaying cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
         AppLog.flicker.info("[FlickerTrace] Home didEndDisplaying index=\(indexPath.item), cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16)), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath)), playerState=\(String(describing: self.viewModel.currentPlayer.state))")
+        if currentPlayingCell === cell {
+            currentPlayingCell = nil
+            currentPlayingCellIndexPath = nil
+        }
         viewModel.didEndDisplaying(at: indexPath)
     }
 }

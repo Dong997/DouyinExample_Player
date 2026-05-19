@@ -104,6 +104,7 @@ class VideoCell: UICollectionViewCell {
     func configure(with model: VideoModel) {
         titleLabel.text = model.title
         controlView.resetForReuse()
+        coverImageView.kf.cancelDownloadTask()
         coverImageView.layer.removeAllAnimations()
 
         if let coverImage = model.coverImage {
@@ -135,6 +136,7 @@ class VideoCell: UICollectionViewCell {
         coverFadeAnimator?.stopAnimation(true)
         coverFadeAnimator = nil
         controlView.resetForReuse()
+        coverImageView.kf.cancelDownloadTask()
         coverImageView.layer.removeAllAnimations()
         coverImageView.image = nil
         coverImageView.isHidden = false

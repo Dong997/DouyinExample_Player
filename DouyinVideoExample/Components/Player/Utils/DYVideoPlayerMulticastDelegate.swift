@@ -68,6 +68,10 @@ public class DYVideoPlayerMulticastDelegate: DYVideoPlayerDelegate {
         forEach { $0.player(player, didUpdateVideoSize: size) }
     }
 
+    public func playerReadyForDisplay(_ player: DYVideoPlayerSession) {
+        forEach { $0.playerReadyForDisplay(player) }
+    }
+
     public func player(_ player: DYVideoPlayerSession, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?) {
         forEach { $0.player(player, didChangeContainerFrom: oldContainer, to: newContainer) }
     }

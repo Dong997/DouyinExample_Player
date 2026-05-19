@@ -127,6 +127,9 @@ public protocol DYVideoPlayerDelegate: AnyObject {
     
     /// 视频尺寸信息回调 (可用于调整UI比例)
     func player(_ player: DYVideoPlayerSession, didUpdateVideoSize size: CGSize)
+
+    /// 播放器画面已可显示，通常表示首帧已经进入 AVPlayerLayer。
+    func playerReadyForDisplay(_ player: DYVideoPlayerSession)
     
     func player(_ player: DYVideoPlayerSession, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?)
 }
@@ -138,6 +141,7 @@ public extension DYVideoPlayerDelegate {
     func player(_ player: DYVideoPlayerSession, didFailWithError error: Error?) {}
     func playerDidFinishPlaying(_ player: DYVideoPlayerSession) {}
     func player(_ player: DYVideoPlayerSession, didUpdateVideoSize size: CGSize) {}
+    func playerReadyForDisplay(_ player: DYVideoPlayerSession) {}
     func player(_ player: DYVideoPlayerSession, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?) {}
 }
 
@@ -217,6 +221,7 @@ public protocol DYVideoPlayerSession: AnyObject, DYVideoAdvancedControlInput {
     var containerView: UIView? { get }
     var originalURL: URL? { get }
     var currentURL: URL? { get }
+    var isReadyForDisplay: Bool { get }
     func updateContainer(_ view: UIView)
     func isPlaying(url: URL) -> Bool
 }

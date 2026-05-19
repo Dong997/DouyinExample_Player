@@ -34,9 +34,9 @@ class HomeViewModel: ObservableObject {
     /// 是否正在拖拽进度条
     var isDraggingProgress: Bool = false
 
-    /// 播放器开始播放时的直接回调（绕过 Combine 管道，减少延迟）
-    /// 用于封面图淡出等需要即时响应的场景
-    var onPlayerStartPlaying: (() -> Void)?
+    /// 播放器首帧可显示时的直接回调（绕过 Combine 管道，减少延迟）
+    /// 用于封面图淡出等需要精确响应渲染时机的场景
+    var onPlayerReadyForDisplay: (() -> Void)?
 
     // MARK: - Dependencies
 
@@ -220,9 +220,8 @@ class HomeViewModel: ObservableObject {
         switch event {
         case .stateChanged(let state, _):
             playerState = state
-            if state == .playing {
-                onPlayerStartPlaying?()
-            }
+        case .readyForDisplay:
+            onPlayerReadyForDisplay?()
         case .progressUpdated(let progress, let currentTime, let totalTime, _):
             if !isDraggingProgress {
                 progressInfo = (progress, currentTime, totalTime)

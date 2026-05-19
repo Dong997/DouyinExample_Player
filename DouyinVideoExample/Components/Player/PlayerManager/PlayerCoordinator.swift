@@ -11,6 +11,7 @@ enum PlayerCoordinatorEvent {
     case error(Error?, IndexPath)
     case finished(IndexPath)
     case videoSizeChanged(CGSize, IndexPath)
+    case readyForDisplay(IndexPath)
 }
 
 /// 播放器协调器
@@ -648,6 +649,12 @@ extension PlayerCoordinator: DYVideoPlayerDelegate {
     func player(_ player: DYVideoPlayerSession, didUpdateVideoSize size: CGSize) {
         guard player === currentPlayer, let indexPath = currentPlayingIndexPath else { return }
         eventPublisher.send(.videoSizeChanged(size, indexPath))
+    }
+
+    func playerReadyForDisplay(_ player: DYVideoPlayerSession) {
+        guard player === currentPlayer, let indexPath = currentPlayingIndexPath else { return }
+        AppLog.flicker.info("[FlickerTrace] Coordinator readyForDisplay index=\(indexPath.item), player=\(self.playerIdentity(player))")
+        eventPublisher.send(.readyForDisplay(indexPath))
     }
 
     func player(_ player: DYVideoPlayerSession, didChangeContainerFrom oldContainer: UIView?, to newContainer: UIView?) {}

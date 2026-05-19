@@ -64,7 +64,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
 
     /// 当前播放器是否已有可显示的视频画面，用于列表切换时避免封面层重新盖上造成闪烁。
     public var isReadyForDisplay: Bool {
-        return player != nil && playerItem?.status == .readyToPlay
+        return player != nil && playerView.playerLayer.isReadyForDisplay
     }
     
     /// 是否静音
@@ -166,8 +166,12 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
     private var bufferObserver: NSKeyValueObservation?
     /// 播放控制状态 KVO（iOS 10+）
     private var timeControlStatusObserver: NSKeyValueObservation?
+    /// 播放层首帧可显示 KVO
+    private var readyForDisplayObserver: NSKeyValueObservation?
     /// 当前播放项 KVO (用于 Looper 切换 Item 时更新)
     private var currentItemObserver: NSKeyValueObservation?
+    /// 当前资源是否已经发出首帧可显示事件
+    private var hasNotifiedReadyForDisplay = false
     
     /// 首帧渲染标记：prepare 模式下 play→pause 渲染首帧时为 true，
     /// 期间抑制状态回调避免外部误判为正在播放
@@ -208,6 +212,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
 
         self.currentURL = url
         self.originalURL = originalURL
+        hasNotifiedReadyForDisplay = false
         self.updateState(.preparing)
 
         loadAssetAndCreatePlayer(url: url, autoPlay: false)
@@ -249,6 +254,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         self.currentURL = url
         self.originalURL = originalURL
         self.pendingSeekTime = seekTo
+        hasNotifiedReadyForDisplay = false
 
         view.layoutIfNeeded()
         playerView.removeFromSuperview()
@@ -447,6 +453,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         }
         playerView.player = player
         addPlayerObservers()
+        addReadyForDisplayObserver()
         schedulePreparationTimeout(for: url, requestID: requestID)
 
         asset.loadValuesAsynchronously(forKeys: ["tracks"]) { [weak self] in
@@ -557,6 +564,7 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         preparationTimeoutWorkItem?.cancel()
         preparationTimeoutWorkItem = nil
         isRenderingFirstFrame = false
+        hasNotifiedReadyForDisplay = false
         pendingSeekTime = nil
         playerItem = nil
         
@@ -672,6 +680,28 @@ public class DYVideoPlayer: NSObject, DYVideoAdvancedControlInput {
         
         timeControlStatusObserver?.invalidate()
         timeControlStatusObserver = nil
+
+        readyForDisplayObserver?.invalidate()
+        readyForDisplayObserver = nil
+    }
+
+    /// 监听 AVPlayerLayer 首帧可显示状态。封面淡出依赖这个事件，而不是播放状态。
+    private func addReadyForDisplayObserver() {
+        readyForDisplayObserver?.invalidate()
+        readyForDisplayObserver = playerView.playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] _, _ in
+            DispatchQueue.main.async { [weak self] in
+                self?.notifyReadyForDisplayIfNeeded()
+            }
+        }
+    }
+
+    private func notifyReadyForDisplayIfNeeded() {
+        guard !hasNotifiedReadyForDisplay,
+              player != nil,
+              playerView.playerLayer.isReadyForDisplay else { return }
+        hasNotifiedReadyForDisplay = true
+        AppLog.flicker.info("[FlickerTrace] DYVideoPlayer readyForDisplay player=\(self.debugIdentity), state=\(String(describing: self.state)), url=\(String(describing: self.currentURL?.lastPathComponent)), containerSet=\(self.containerView != nil)")
+        multicastDelegate.playerReadyForDisplay(self)
     }
     
     /// 移除 PlayerItem 级别的监听
