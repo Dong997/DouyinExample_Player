@@ -264,13 +264,16 @@ class HomeViewController: UIViewController, DYOrientationConfigurable {
         currentPlayingCell = cell
         AppLog.flicker.info("[FlickerTrace] Home playVideo begin index=\(index), cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16)), url=\(video.videoURL.lastPathComponent), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath)), playerState=\(String(describing: self.viewModel.currentPlayer.state)), cellBounds=\(String(describing: cell.bounds)), containerBounds=\(String(describing: cell.playerContainerView.bounds))")
 
+        let preboundPlayer = viewModel.bindPreloadedPlayerIfNeeded(at: index, containerView: cell.playerContainerView)
+        let canShowVideoImmediately = preboundPlayer?.isPlaying(url: video.videoURL) == true && preboundPlayer?.isReadyForDisplay == true
+
         viewModel.playVideo(at: indexPath, containerView: cell.playerContainerView)
 
         let player = viewModel.currentPlayer
         AppLog.flicker.info("[FlickerTrace] Home playVideo requested index=\(index), cell=\(String(ObjectIdentifier(cell).hashValue, radix: 16)), playerState=\(String(describing: player.state)), playerURL=\(String(describing: player.currentURL?.absoluteString)), originalURL=\(String(describing: player.originalURL?.absoluteString)), playerContainerMatches=\(player.containerView === cell.playerContainerView)")
-        if player.state == .playing, player.isPlaying(url: video.videoURL) {
-            // 只有真正进入播放态后才隐藏占位图，避免 ready 但首帧未渲染时露黑。
-            cell.hideCoverImage(animated: true)
+        if player.isPlaying(url: video.videoURL), player.state == .playing || canShowVideoImmediately {
+            // 已有可显示的视频画面时不再盖封面，避免预加载命中后的二次闪烁。
+            cell.hideCoverImage(animated: !canShowVideoImmediately)
         } else {
             // 播放开始前保持 last-frame/封面稳定，等待 .playing 回调后再淡出。
             cell.showCoverImage()
@@ -489,6 +492,11 @@ extension HomeViewController: UICollectionViewDelegate, UICollectionViewDataSour
         AppLog.flicker.info("[FlickerTrace] Home willDisplay index=\(index), cell=\(String(ObjectIdentifier(videoCell).hashValue, radix: 16)), currentIndex=\(String(describing: self.viewModel.currentPlayingIndexPath)), playerState=\(String(describing: self.viewModel.currentPlayer.state)), contentOffset=\(String(describing: collectionView.contentOffset))")
         if let player = viewModel.bindPreloadedPlayerIfNeeded(at: index, containerView: videoCell.playerContainerView) {
             AppLog.flicker.info("[FlickerTrace] Home willDisplay bound preloaded index=\(index), cell=\(String(ObjectIdentifier(videoCell).hashValue, radix: 16)), playerState=\(String(describing: player.state)), readyForDisplay=\(player.isReadyForDisplay), preloadedReady=\(player.isPreloadedAndReady), containerMatches=\(player.containerView === videoCell.playerContainerView)")
+            if viewModel.videos.indices.contains(index),
+               player.isPlaying(url: viewModel.videos[index].videoURL),
+               player.isReadyForDisplay {
+                videoCell.hideCoverImage(animated: false)
+            }
             if player.state == .paused || player.state == .idle {
                 videoCell.controlView.updateCenterBtnState(.preparing)
             }
